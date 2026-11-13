@@ -1,0 +1,18 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "5dive-email",
+  "description": "The 5dive email plugin (the `5dive email` verb and the email channel): each agent gets its own email address, in the firm's mailbox or on the firm's own server.",
+  "owner": {
+    "name": "5dive",
+    "email": "support@5dive.com"
+  },
+  "plugins": [
+    {
+      "name": "email",
+      "description": "Each agent gets its own email address: in a mailbox the firm already runs (Google Workspace or any IMAP and SMTP server), or on the server's own mail server for a domain the firm points at it. Mail arrives as a chat and the agent answers in the same thread. A first mail from someone new, and a first mail to someone new, each wait for the owner's tap. 5dive hosts no mail.",
+      "category": "communication",
+      "source": "./email",
+      "homepage": "https://github.com/5dive-ai/5dive-email"
+    }
+  ]
+}
