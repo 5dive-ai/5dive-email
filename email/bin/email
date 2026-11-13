@@ -245,7 +245,7 @@ email_status() {
   local agent="${1:-}"
   [[ -n "$agent" ]] || fail "$E_USAGE" "usage: 5dive email status <agent>"
   _name_ok "$agent" || fail "$E_VALIDATION" "not an agent name: $agent"
-  local dir cfg connected=false address="" mode="" gate=on door=on cap=50 chans last="" held=0 held_in=0 sent=0
+  local dir cfg connected=false address="" mode="" gate=on door=on cap=50 chans last="" held=0 held_in=0 sent=0 allowed='[]'
   dir=$(_state_dir "$agent"); cfg="$dir/config.json"
   if [[ -r "$cfg" ]] && jq -e '.address and .mode and .smtp' "$cfg" >/dev/null 2>&1; then
     connected=true
@@ -253,6 +253,8 @@ email_status() {
     [[ "$(jq -r '.approve_new' "$cfg")" == false ]] && gate=off
     [[ "$(jq -r '.approve_inbound' "$cfg")" == false ]] && door=off
     cap=$(jq -r '.daily_cap // 50' "$cfg")
+    # DIVE-8404: the owner's list, so the app's settings screen can show it.
+    allowed=$(jq -c '[(.allowed // [])[] | strings]' "$cfg" 2>/dev/null || echo '[]')
   fi
   chans=$(_agent_json "$agent" | jq -r '.channels // "none"' 2>/dev/null || echo "?")
   [[ -r "$dir/messages.log" ]] && last=$(tail -1 "$dir/messages.log" | cut -f1,2)
@@ -263,8 +265,8 @@ email_status() {
   fi
   if [[ "${FIVEDIVE_JSON_MODE:-0}" == 1 ]]; then
     jq -n --arg a "$agent" --argjson c "$connected" --arg ad "$address" --arg m "$mode" --arg g "$gate" --arg d "$door" --arg cap "$cap" \
-      --arg ch "$chans" --arg last "$last" --argjson h "$held" --argjson hi "$held_in" --argjson s "$sent" \
-      '{ok:true, data:{agent:$a, connected:$c, address:$ad, mode:$m, gate:$g, inbound_gate:$d, daily_cap:($cap|tonumber? // 50), sent_today:$s, held:$h, held_inbound:$hi, channels:$ch, last_message:$last}}'
+      --arg ch "$chans" --arg last "$last" --argjson h "$held" --argjson hi "$held_in" --argjson s "$sent" --argjson al "$allowed" \
+      '{ok:true, data:{agent:$a, connected:$c, address:$ad, mode:$m, gate:$g, inbound_gate:$d, daily_cap:($cap|tonumber? // 50), sent_today:$s, held:$h, held_inbound:$hi, channels:$ch, last_message:$last, allowed:$al}}'
     return 0
   fi
   echo "agent:      $agent"
@@ -275,6 +277,7 @@ email_status() {
   echo "writing to: $([[ "$gate" == on ]] && echo "a first mail to a new outside address waits for your tap" || echo "mails anyone (gate off)")"
   echo "mail from:  $([[ "$door" == on ]] && echo "a first mail from someone unknown waits for your tap, unseen by $agent" || echo "anyone reaches $agent (inbound gate off)")"
   echo "today:      $sent of $cap mails sent"
+  echo "no asking:  $(jq -r 'if length == 0 then "nobody yet (sudo 5dive email allow '"$agent"' <address|@domain>)" else join(", ") end' <<<"$allowed")"
   (( held > 0 )) && echo "waiting:    $held outgoing mail(s) wait for your answer (5dive people ls)"
   (( held_in > 0 )) && echo "at the door: $held_in incoming mail(s) from new senders wait for your answer (5dive people ls)"
   echo "last:       ${last:-"no mail yet"}"
