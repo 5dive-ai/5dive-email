@@ -22,10 +22,12 @@ as it is. A cloud mailbox needs: `sudo 5dive config local-only allow email`.
 1. Pick a domain or subdomain for the agents, e.g. `ai.yourfirm.com`.
 2. `sudo 5dive email server setup --domain=ai.yourfirm.com`
    By default the server sends mail itself, signed with its own DKIM key. That
-   works from an established server. A NEW cloud account often has port 25
-   out blocked at first (Hetzner until the first paid invoice, DigitalOcean
-   and Vultr until you open a support ticket). Then ask the provider to open
-   it, or send through a relay:
+   works from an established server. A NEW cloud account often blocks sending
+   on port 25 until you ask the host (Hetzner until the first paid invoice,
+   DigitalOcean and Vultr until you open a support ticket). Setup checks this
+   for you and stops if it is blocked (`sudo 5dive email server check` runs the
+   same check alone; it never sends mail). Then ask the host to open it, use
+   the firm's own mailbox (part A), or send through a relay:
    - **Resend:** add `--relay=resend --task=<DIVE-N>`. Verify the domain in
      Resend first (resend.com, Domains, and set the records it shows), then
      paste a Resend API key into the one-time link.

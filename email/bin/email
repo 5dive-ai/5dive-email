@@ -27,6 +27,11 @@
 #       the API key through the one-time link). Postmark, Amazon SES or the
 #       firm's own server: --relay-host.
 #   server status
+#   server check              can this box send mail itself? (port 25 out)
+#       Setup runs the same check when no relay is named, and stops if the host
+#       blocks port 25 out: mail would sit in the queue and bounce days later.
+#       The check opens port 25 on a big mail provider, reads its greeting and
+#       says QUIT. It never sends mail.
 #
 # We host no mail: the mailbox is the firm's, or the box's own server.
 set -euo pipefail
@@ -368,7 +373,74 @@ email_server() {
   case "$sub" in
     setup) _server_setup "$@" ;;
     status) _server_status "$@" ;;
-    *) fail "$E_USAGE" "usage: 5dive email server setup --domain=<d> | status" ;;
+    check) _server_check "$@" ;;
+    *) fail "$E_USAGE" "usage: 5dive email server setup --domain=<d> | status | check" ;;
+  esac
+}
+
+# ── can this box send mail itself? (DIVE-8347) ────────────────────────────
+# New cloud accounts block port 25 OUT (Hetzner until the first paid invoice,
+# DigitalOcean and Vultr until a support ticket). Direct sending from such a box
+# queues every mail and bounces it two days later, silently. So: connect to a
+# big provider's mail server, read its 220 greeting, say QUIT. Never MAIL FROM.
+# Two providers, so one refusing this IP does not read as a blocked port.
+# The address family is the sender's (nodemailer): IPv4 whenever this box has
+# an IPv4 address, else IPv6. A probe over IPv6 passed on a box whose IPv4
+# port 25 was shut, while the real mail would have gone out over IPv4.
+SEND_PROBE_HOSTS="${EMAIL_SEND_PROBE_HOSTS:-gmail-smtp-in.l.google.com:25 outlook-com.olc.protection.outlook.com:25}"
+SEND_PROBE_TIMEOUT="${EMAIL_SEND_PROBE_TIMEOUT:-5}"
+
+# 0 open, 1 shut (no greeting from any), 2 unknown (no name resolved: no DNS here)
+_send_probe() {
+  local t h p a="" resolved=0 v4=0
+  hostname -I 2>/dev/null | grep -qE '(^| )[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' && v4=1
+  for t in $SEND_PROBE_HOSTS; do
+    h="${t%:*}"; p="${t##*:}"
+    a=""
+    (( v4 )) && a=$(getent ahostsv4 "$h" 2>/dev/null | awk 'NR==1{print $1}')
+    [[ -n "$a" ]] || a=$(getent ahostsv6 "$h" 2>/dev/null | awk 'NR==1{print $1}')
+    [[ -n "$a" ]] || continue
+    resolved=1
+    # shellcheck disable=SC2016
+    timeout "$SEND_PROBE_TIMEOUT" bash -c '
+      exec 3<>"/dev/tcp/$1/$2" || exit 1
+      IFS= read -r -t "$3" line <&3 || exit 1
+      [[ "$line" == 220* ]] || exit 1
+      printf "QUIT\r\n" >&3
+      IFS= read -r -t 1 _ <&3 || true' _ "$a" "$p" "$SEND_PROBE_TIMEOUT" 2>/dev/null && return 0
+  done
+  (( resolved )) && return 1
+  return 2
+}
+
+_send_blocked_text() {  # <domain>
+  cat <<EOF
+This server's host blocks sending mail: port 25 out is shut, so mail sent
+straight from here would never arrive. New cloud accounts (Hetzner, DigitalOcean,
+Vultr) block it until you ask them. Pick one:
+  - Send through Resend:
+      sudo 5dive email server setup --domain=$1 --relay=resend --task=<DIVE-N>
+  - Or your firm's own mail server as the relay:
+      sudo 5dive email server setup --domain=$1 --relay-host=<h> --relay-login=<u> --task=<DIVE-N>
+  - Or skip this server's mail and use the firm's own mailbox for the agent:
+      sudo 5dive email connect <agent> --address=<a> --provider=google|other
+  - Or ask the host to open port 25 out, then run this setup again.
+EOF
+}
+
+_server_check() {
+  [[ $# -eq 0 ]] || fail "$E_USAGE" "usage: 5dive email server check"
+  if _offline; then
+    echo "This server is offline (local-only): mail stays inside the office, nothing to check."
+    return 0
+  fi
+  local rc=0; _send_probe || rc=$?
+  case "$rc" in
+    0) echo "This server can send mail itself (port 25 out is open)." ;;
+    1) local d="<your domain>"
+       [[ -r "$MAIL_ETC/server.json" ]] && d=$(jq -r '.domain // "<your domain>"' "$MAIL_ETC/server.json")
+       _send_blocked_text "$d" >&2; return "$E_PERMISSION" ;;
+    *) warn "could not check sending: this server cannot look up mail servers (no DNS?)"; return "$E_VALIDATION" ;;
   esac
 }
 
@@ -401,6 +473,17 @@ _server_setup() {
       what="Resend (your API key from resend.com, API Keys; first verify $domain there under Domains)" ;;
     *) fail "$E_USAGE" "--relay=resend is the one named relay; any other (Postmark, Amazon SES, your firm's server): --relay-host=<h> --relay-login=<u>" ;;
   esac
+  # No relay named: this box sends itself, so it has to be able to. Checked
+  # before anything is installed, so a refusal leaves the box as it was.
+  if [[ -z "$rh" ]] && ! _offline; then
+    step "Checking this server can send mail (port 25 out)"
+    local prc=0; _send_probe || prc=$?
+    case "$prc" in
+      0) ;;
+      1) _send_blocked_text "$domain" >&2; exit "$E_PERMISSION" ;;
+      *) warn "could not check sending (this server cannot look up mail servers). If mail does not arrive, add a relay: --relay=resend" ;;
+    esac
+  fi
   local relay=null
   if [[ -n "$rh" ]]; then
     _host_ok "$rh" && _port_ok "$rp" || fail "$E_VALIDATION" "bad --relay-host or --relay-port"
@@ -503,11 +586,19 @@ _server_status() {
   [[ -r "$conf" ]] || { echo "no mail server on this box (sudo 5dive email server setup --domain=<d>)"; return 0; }
   local domain active q n
   domain=$(jq -r .domain "$conf"); active=$("$SYSTEMCTL" is-active "$UNIT" 2>/dev/null || true)
-  q=$(find "$MAIL_SPOOL/queue" -name '*.json' 2>/dev/null | wc -l); n=$(jq '.agents | length' "$conf")
+  q=$({ find "$MAIL_SPOOL/queue" -name '*.json' 2>/dev/null || true; } | wc -l); n=$(jq '.agents | length' "$conf")
   echo "domain:     $domain"
   echo "server:     ${active:-inactive}"
   echo "agents:     $n ($(jq -r '.agents | keys | map(. + "@'"$domain"'") | join(", ")' "$conf"))"
   echo "relay:      $(jq -r '.relay.host // "none (straight to the recipient)"' "$conf")"
+  if ! jq -e '.relay.host' "$conf" >/dev/null 2>&1 && ! _offline; then
+    local prc=0; _send_probe || prc=$?
+    case "$prc" in
+      0) echo "sending:    ok (port 25 out is open)" ;;
+      1) echo "sending:    BLOCKED: this host shuts port 25 out, so mail will not arrive. Fix: sudo 5dive email server setup --relay=resend --task=<DIVE-N>, or ask the host to open port 25" ;;
+      *) echo "sending:    could not check (no DNS here)" ;;
+    esac
+  fi
   echo "waiting:    $q outgoing mail(s) not delivered yet"
   echo "MX now:     $(dig +short MX "$domain" 2>/dev/null | head -1 || echo '?')"
   [[ -r "$MAIL_SPOOL/mail.log" ]] && echo "last:       $(tail -1 "$MAIL_SPOOL/mail.log" | cut -f1,2)"
@@ -544,6 +635,7 @@ _email_main() {
   sudo 5dive email cap <agent> <n>       mails a day (default 50)
   sudo 5dive email server setup --domain=<d> [--relay=resend | --relay-host=<h> --relay-login=<u>]
   5dive email server status
+  5dive email server check       can this server send mail itself? (port 25 out)
 USAGE
       [[ -n "$sub" ]] && return 0
       return "$E_USAGE" ;;
