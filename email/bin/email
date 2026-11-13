@@ -291,7 +291,9 @@ email_disconnect() {
   local info chans next; info=$(_agent_json "$agent") || fail "$E_NOT_FOUND" "no agent named '$agent'"
   chans=$(jq -r '.channels // "none"' <<<"$info")
   if [[ ",$chans," == *",email,"* ]]; then
-    next=$(tr ',' '\n' <<<"$chans" | grep -vx email | paste -sd, -)
+    # DIVE-8404: email as the agent's only channel leaves grep nothing to print, and its exit 1 under
+    # pipefail killed disconnect silently (seen live on dive8315-mailtest).
+    next=$(tr ',' '\n' <<<"$chans" | { grep -vx email || true; } | paste -sd, -)
     step "Turning off the email channel for $agent"
     "$FIVEDIVE_BIN" agent config "$agent" set channels="${next:-none}" >&2 || warn "could not change channels; do it by hand"
   fi

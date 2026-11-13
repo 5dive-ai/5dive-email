@@ -177,6 +177,11 @@ OUT=$(FIVEDIVE_JSON_MODE=1 bash "$BIN" status max 2>&1)
 run disconnect max
 [[ $RC == 0 && ! -e "$CFG" && ! -e "$W/conn/email-max.env" && "$(jq -c '.agents' "$W/etc/server.json")" == '{}' && "$(cat "$W/channels")" == telegram ]] \
   && ok "T2 disconnect: config, password and server entry gone; channel off" || bad "T2 disconnect" "$RC $OUT"
+# DIVE-8404: an agent whose ONLY channel is email (grep -v finds nothing to keep).
+echo email >"$W/channels"; mkdir -p "$(dirname "$CFG")"; echo '{"address":"x@example.com","mode":"imap","smtp":{}}' >"$CFG"
+run disconnect max
+[[ $RC == 0 && ! -e "$CFG" && "$(cat "$W/channels")" == none ]] \
+  && ok "T3 disconnect works when email is the agent's only channel (channels=none)" || bad "T3 email-only disconnect" "$RC $OUT"
 
 echo "$PASS passed, $FAIL failed"
 (( FAIL == 0 ))
