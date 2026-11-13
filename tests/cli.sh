@@ -12,7 +12,8 @@ set -uo pipefail
 [[ $EUID -eq 0 ]] || { echo "run as root: sudo bash $0" >&2; exit 2; }
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="$ROOT/email/bin/email"
-W=$(mktemp -d); trap 'rm -rf "$W"' EXIT
+W=$(mktemp -d); GPIDS=()
+trap '(( ${#GPIDS[@]} )) && kill "${GPIDS[@]}" 2>/dev/null; rm -rf "$W"' EXIT
 PASS=0 FAIL=0
 ok()  { PASS=$((PASS + 1)); echo "  ok   $1"; }
 bad() { FAIL=$((FAIL + 1)); echo "  FAIL $1"; [[ -n "${2:-}" ]] && sed 's/^/       /' <<<"$2"; }
@@ -36,6 +37,11 @@ echo telegram >"$W/channels"
 export STUB_LOG="$W/log" STUB_CHANNELS="$W/channels"
 export EMAIL_5DIVE_BIN="$W/5dive" EMAIL_CONNECTORS_DIR="$W/conn" AGENT_HOME_ROOT="$W/home" EMAIL_AGENT_USER="$ME"
 export EMAIL_MAIL_ETC="$W/etc" EMAIL_MAIL_SPOOL="$W/spool" FIVE_LOCAL_ONLY_FILE="$W/local-only"
+# The send check (DIVE-8347) never reaches the internet here: by default it
+# meets a closed local port. Arms that need it open point it at tests/greeter.py.
+# An install that gets past the check stops at once: MAIL_OPT sits under a file.
+: >"$W/blocker"
+export EMAIL_SEND_PROBE_HOSTS="127.0.0.1:1" EMAIL_SEND_PROBE_TIMEOUT=1 EMAIL_MAIL_OPT="$W/blocker/opt"
 CFG="$W/home/agent-max/.claude/channels/email/config.json"
 run() { : >"$STUB_LOG"; OUT=$(bash "$BIN" "$@" 2>&1); RC=$?; }
 
@@ -97,6 +103,44 @@ run server setup --domain=example.com --relay=resend --relay-host=smtp.example.c
 run server setup --domain=example.com --relay=postmark
 [[ $RC == 2 && "$OUT" == *"--relay-host"* ]] && ok "R4 an unknown preset is refused, pointing at --relay-host" || bad "R4 unknown preset" "$RC $OUT"
 
+echo "can this box send? (port 25 out, DIVE-8347)"
+greeter() {  # <name> <greeting>: start a fake mail server, its port in $GPORT
+  local d="$W/g-$1"; mkdir -p "$d"
+  python3 "$ROOT/tests/greeter.py" "$2" "$d/port" "$d/log" >/dev/null 2>&1 & GPIDS+=($!)
+  local _i; for _i in $(seq 50); do [[ -s "$d/port" ]] && break; sleep 0.1; done
+  GPORT=$(cat "$d/port"); : >"$d/log"
+}
+greeter open "220 mx.example.com ESMTP"; OPEN=127.0.0.1:$GPORT
+greeter refuse "554 no service"; REFUSE=127.0.0.1:$GPORT
+greeter silent silent; SILENT=127.0.0.1:$GPORT
+SHUT=127.0.0.1:1
+EMAIL_SEND_PROBE_HOSTS=$OPEN run server check
+[[ $RC == 0 && "$OUT" == *"can send mail itself"* ]] && ok "P1 open: server check says this box can send" || bad "P1 check open" "$RC $OUT"
+[[ "$(tr -d '\r' <"$W/g-open/log")" == "QUIT" ]] && ok "P1b the check only says QUIT: no HELO, no MAIL FROM, no mail" || bad "P1b probe sent more" "$(cat -A "$W/g-open/log")"
+EMAIL_SEND_PROBE_HOSTS=$SHUT run server check
+[[ $RC == 10 && "$OUT" == *"blocks sending mail"* && "$OUT" == *"--relay=resend"* && "$OUT" == *"--provider=google|other"* ]] \
+  && ok "P2 shut: server check says the host blocks sending, offers Resend and the firm's mailbox" || bad "P2 check shut" "$RC $OUT"
+EMAIL_SEND_PROBE_HOSTS="$REFUSE $SILENT" run server check
+[[ $RC == 10 ]] && ok "P3 a server that answers 554, or never greets, is not an open port 25" || bad "P3 not 220" "$RC $OUT"
+EMAIL_SEND_PROBE_HOSTS=$SHUT run server setup --domain=example.com
+[[ $RC == 10 && "$OUT" == *"blocks sending mail"* && "$OUT" == *"--domain=example.com --relay=resend"* && "$OUT" != *"Installing"* \
+   && ! -e "$W/etc/server.json" && ! -e "$W/etc/dkim.key" ]] \
+  && ok "P4 shut: setup with no relay refuses, names the routes with the domain filled in, writes nothing" || bad "P4 setup shut" "$RC $OUT"
+EMAIL_SEND_PROBE_HOSTS="$SHUT $OPEN" run server setup --domain=example.com
+[[ "$OUT" != *"blocks sending"* && "$OUT" == *"Installing OpenAgent Mail"* ]] \
+  && ok "P5 open (second provider answers): setup goes on to install, sending direct as today" || bad "P5 setup open" "$RC $OUT"
+EMAIL_SEND_PROBE_HOSTS=nowhere.invalid:25 run server setup --domain=example.com
+[[ "$OUT" == *"could not check sending"* && "$OUT" == *"Installing OpenAgent Mail"* ]] \
+  && ok "P6 no DNS: a warning, not a false 'blocked'; setup goes on" || bad "P6 no dns" "$RC $OUT"
+EMAIL_SEND_PROBE_HOSTS=$SHUT run server setup --domain=example.com --relay=resend
+[[ $RC == 6 && "$OUT" != *"Checking this server can send"* ]] && ok "P7 a relay named: no port 25 check (the relay sends)" || bad "P7 relay skips" "$RC $OUT"
+: >"$FIVE_LOCAL_ONLY_FILE"
+EMAIL_SEND_PROBE_HOSTS=$SHUT run server check
+[[ $RC == 0 && "$OUT" == *"offline"* ]] && ok "P8 local-only: mail stays in the office, nothing to check" || bad "P8 offline" "$RC $OUT"
+EMAIL_SEND_PROBE_HOSTS=$SHUT run server setup --domain=example.com
+[[ "$OUT" != *"blocks sending"* && "$OUT" == *"Installing OpenAgent Mail"* ]] && ok "P8b local-only: setup does not probe the internet" || bad "P8b offline setup" "$RC $OUT"
+rm -f "$FIVE_LOCAL_ONLY_FILE"
+
 echo "local-only"
 : >"$FIVE_LOCAL_ONLY_FILE"
 run connect max --address=$A --provider=google
@@ -119,6 +163,11 @@ PW=$(jq -r .smtp.pass "$CFG"); H=$(printf '%s' "$PW" | sha256sum | cut -d' ' -f1
    && "$(jq -r .agents.max.maildir "$W/etc/server.json")" == "$W/spool/boxes/max" && -d "$W/spool/boxes/max/new" ]] \
   && ok "S2 self-hosted: max@<domain>, a fresh password whose hash is on the server, its own maildir" || bad "S2 self-hosted" "$RC $OUT $(cat "$CFG")"
 [[ "$OUT" != *"$PW"* ]] && ok "S2b the new password is never printed" || bad "S2b printed"
+
+EMAIL_SEND_PROBE_HOSTS=$SHUT run server status
+[[ "$OUT" == *"sending:    BLOCKED"*"--relay=resend"* ]] && ok "P9 server status shows sending BLOCKED and the fix" || bad "P9 status shut" "$RC $OUT"
+EMAIL_SEND_PROBE_HOSTS=$OPEN run server status
+[[ "$OUT" == *"sending:    ok"* ]] && ok "P9b server status shows sending ok when port 25 is open" || bad "P9b status open" "$RC $OUT"
 
 echo "status, disconnect"
 OUT=$(FIVEDIVE_JSON_MODE=1 bash "$BIN" status max 2>&1)
