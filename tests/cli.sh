@@ -108,7 +108,19 @@ run connect max --address=$A --imap-host=mail.example.com --smtp-host=mail.examp
 [[ $RC == 0 && "$(jq -c '[.trusted_authserv_id,.exchange]' "$CFG")" == '["mx.example.com",true]' ]] && ok "G15b a re-run of connect keeps them" || bad "G15b keep" "$(cat "$CFG")"
 run connect max --address=$A --imap-host=mail.example.com --smtp-host=mail.example.com '--trusted-authserv-id=mx.example.com;x'
 [[ $RC == 3 && "$(jq -r .trusted_authserv_id "$CFG")" == mx.example.com ]] && ok "G16 a bad server name is refused, nothing changed" || bad "G16 bad id" "$RC $OUT"
+# DIVE-8409: status --json names whether the server's sender check is believed, so the app can say "every mail waits".
+sv() { FIVEDIVE_JSON_MODE=1 bash "$BIN" status max 2>&1 | jq -r '.data.sender_server'; }
+SV1=$(sv)
+jq '.trusted_authserv_id = null | .exchange = null' "$CFG" >"$W/c" && cat "$W/c" >"$CFG"; SV2=$(sv)
+OUT=$(bash "$BIN" status max 2>&1); SV2T=$OUT
+jq '.exchange = true' "$CFG" >"$W/c" && cat "$W/c" >"$CFG"; SV3=$(sv)
+jq '.exchange = null | .imap.host = "Outlook.Office365.com"' "$CFG" >"$W/c" && cat "$W/c" >"$CFG"; SV4=$(sv)
+jq '.imap.host = "imap.gmail.com"' "$CFG" >"$W/c" && cat "$W/c" >"$CFG"; SV5=$(sv)
+[[ "$SV1 $SV2 $SV3 $SV4 $SV5" == "known unknown exchange known known" ]] \
+  && ok "G17 status --json sender_server: named check known, unknown server unknown, --exchange exchange, M365/Gmail known" || bad "G17 sender_server" "$SV1 $SV2 $SV3 $SV4 $SV5"
+[[ "$SV2T" == *"EVERY mail waits for your tap"*"gate max sender off"* ]] && ok "G17b status says every mail waits on an unknown server, and the way out" || bad "G17b status words" "$SV2T"
 run gate max sender off   # S2c reads it back after a self-hosted connect
+[[ "$(sv)" == known && "$(bash "$BIN" status max 2>&1)" != *"EVERY mail waits"* ]] && ok "G17c sender check off: no waiting warning" || bad "G17c" "$(bash "$BIN" status max 2>&1)"
 
 echo "the Resend preset (optional; direct sending stays the default)"
 run server setup --domain=example.com --relay=resend
@@ -188,7 +200,7 @@ run gate max spam off
 [[ $RC == 0 && "$(jq -c '.agents.max | [.spam, .virus]' "$W/etc/server.json")" == '[false,null]' ]] && ok "G10 gate spam off: the server skips spam filtering for max only" || bad "G10 spam off" "$RC $OUT $(cat "$W/etc/server.json")"
 run gate max virus off
 OUT=$(FIVEDIVE_JSON_MODE=1 bash "$BIN" status max 2>&1)
-[[ "$(jq -c '.data | [.sender_check,.spam_filter,.virus_scan]' <<<"$OUT")" == '["on","off","off"]' ]] && ok "G11 status --json carries the sender check and both filters" || bad "G11 status filters" "$OUT"
+[[ "$(jq -c '.data | [.sender_check,.spam_filter,.virus_scan,.sender_server]' <<<"$OUT")" == '["on","off","off","own"]' ]] && ok "G11 status --json carries the sender check and both filters" || bad "G11 status filters" "$OUT"
 run gate max spam on; run gate max virus on
 [[ "$(jq -c '.agents.max | [.spam, .virus]' "$W/etc/server.json")" == '[true,true]' ]] && ok "G12 gate spam/virus on again" || bad "G12 on" "$(cat "$W/etc/server.json")"
 OUT=$(bash "$BIN" status max 2>&1)

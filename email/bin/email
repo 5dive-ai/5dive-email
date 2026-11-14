@@ -271,7 +271,7 @@ email_status() {
   local agent="${1:-}"
   [[ -n "$agent" ]] || fail "$E_USAGE" "usage: 5dive email status <agent>"
   _name_ok "$agent" || fail "$E_VALIDATION" "not an agent name: $agent"
-  local dir cfg connected=false address="" mode="" gate=on door=on sender=on spam=on virus=on cap=50 chans last="" held=0 held_in=0 sent=0 allowed='[]'
+  local dir cfg connected=false address="" mode="" gate=on door=on sender=on spam=on virus=on server="" cap=50 chans last="" held=0 held_in=0 sent=0 allowed='[]'
   dir=$(_state_dir "$agent"); cfg="$dir/config.json"
   if [[ -r "$cfg" ]] && jq -e '.address and .mode and .smtp' "$cfg" >/dev/null 2>&1; then
     connected=true
@@ -282,6 +282,15 @@ email_status() {
     cap=$(jq -r '.daily_cap // 50' "$cfg")
     # DIVE-8404: the owner's list, so the app's settings screen can show it.
     allowed=$(jq -c '[(.allowed // [])[] | strings]' "$cfg" 2>/dev/null || echo '[]')
+    # DIVE-8409: does the mail server stamp a sender check this plugin believes (mail.ts mailboxTrust)?
+    # unknown = it does not, so with the sender check on EVERY mail waits for the owner's tap;
+    # exchange = only mail from inside the firm is confirmed. The app says so on its email sheet.
+    if [[ "$mode" == local ]]; then server=own
+    elif [[ -n "$(jq -r '.trusted_authserv_id // empty' "$cfg")" ]]; then server=known
+    elif [[ "$(jq -r '.imap.host // "" | ascii_downcase' "$cfg")" =~ ^(imap\.gmail\.com|outlook\.office365\.com|([a-z0-9-]+\.)*outlook\.com|([a-z0-9-]+\.)*office365\.com)$ ]]; then server=known
+    elif [[ "$(jq -r '.exchange' "$cfg")" == true ]]; then server=exchange
+    else server=unknown
+    fi
     if [[ "$mode" == local ]]; then
       [[ -r "$MAIL_ETC/server.json" ]] && [[ "$(jq -r --arg a "$agent" '.agents[$a].spam' "$MAIL_ETC/server.json" 2>/dev/null)" == false ]] && spam=off
       [[ -r "$MAIL_ETC/server.json" ]] && [[ "$(jq -r --arg a "$agent" '.agents[$a].virus' "$MAIL_ETC/server.json" 2>/dev/null)" == false ]] && virus=off
@@ -299,8 +308,8 @@ email_status() {
   if [[ "${FIVEDIVE_JSON_MODE:-0}" == 1 ]]; then
     jq -n --arg a "$agent" --argjson c "$connected" --arg ad "$address" --arg m "$mode" --arg g "$gate" --arg d "$door" --arg cap "$cap" \
       --arg ch "$chans" --arg last "$last" --argjson h "$held" --argjson hi "$held_in" --argjson s "$sent" --argjson al "$allowed" \
-      --arg sc "$sender" --arg sp "$spam" --arg vi "$virus" \
-      '{ok:true, data:{agent:$a, connected:$c, address:$ad, mode:$m, gate:$g, inbound_gate:$d, sender_check:$sc, spam_filter:$sp, virus_scan:$vi, daily_cap:($cap|tonumber? // 50), sent_today:$s, held:$h, held_inbound:$hi, channels:$ch, last_message:$last, allowed:$al}}'
+      --arg sc "$sender" --arg sp "$spam" --arg vi "$virus" --arg sv "$server" \
+      '{ok:true, data:{agent:$a, connected:$c, address:$ad, mode:$m, gate:$g, inbound_gate:$d, sender_check:$sc, sender_server:$sv, spam_filter:$sp, virus_scan:$vi, daily_cap:($cap|tonumber? // 50), sent_today:$s, held:$h, held_inbound:$hi, channels:$ch, last_message:$last, allowed:$al}}'
     return 0
   fi
   echo "agent:      $agent"
@@ -311,6 +320,11 @@ email_status() {
   echo "writing to: $([[ "$gate" == on ]] && echo "a first mail to a new outside address waits for your tap" || echo "mails anyone (gate off)")"
   echo "mail from:  $([[ "$door" == on ]] && echo "a first mail from someone unknown waits for your tap, unseen by $agent" || echo "anyone reaches $agent (inbound gate off)")"
   echo "sender:     $([[ "$sender" == on ]] && echo "checked: a faked From (no SPF/DKIM/DMARC proof) waits for your tap like a stranger's" || echo "not checked: the From line is believed (sender check off)")"
+  if [[ "$sender" == on && "$server" == unknown ]]; then
+    echo "            this mail server is not known to confirm senders, so EVERY mail waits for your tap (name its check: connect --trusted-authserv-id=, or: sudo 5dive email gate $agent sender off)"
+  elif [[ "$sender" == on && "$server" == exchange ]]; then
+    echo "            only mail from inside the firm is confirmed; mail from outside waits for your tap"
+  fi
   case "$spam" in
     provider) echo "spam/virus: filtered by the mailbox's own provider before $agent reads it" ;;
     *) echo "spam:       $([[ "$spam" == on ]] && echo "filed in the spam folder, never shown to $agent" || echo "not filtered (spam filter off)")"
