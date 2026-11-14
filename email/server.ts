@@ -349,7 +349,12 @@ function verifySender(raw: Buffer, from: string): SenderCheck | undefined {
   if (cfg!.check_sender === false) return undefined
   // Exchange marks mail from inside the firm; its header firewall strips this from outside mail.
   if (cfg!.mode === 'imap' && /^internal$/i.test(headerValues(raw, 'x-ms-exchange-organization-authas')[0] ?? '')) return { ok: true, why: 'inside the firm (Exchange)' }
-  return senderCheck(headerValues(raw, 'authentication-results')[0], from)
+  const ar = headerValues(raw, 'authentication-results')[0]
+  // Google stamps every mail that reaches it over the internet (and stacks its
+  // own on top of any a sender wrote). None at all = it never crossed the
+  // internet: a colleague inside the same Google Workspace.
+  if (!ar && cfg!.mode === 'imap' && /^imap\.gmail\.com$/i.test(cfg!.imap!.host)) return { ok: true, why: 'inside the firm (Google Workspace)' }
+  return senderCheck(ar, from)
 }
 
 const safeName = (s: string) => (s || 'file').replace(/[^A-Za-z0-9._-]+/g, '_').replace(/^\.+/, '').slice(0, 80) || 'file'
