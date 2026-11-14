@@ -27,7 +27,7 @@ import { join } from 'node:path'
 import { ASK_CODEX, guardVerdict, heldVerdict, loadRoles, type Verdict } from '../guard.ts'
 import { activeSource, adapterStateDir, codexCalls } from '../codex.ts'
 
-export function codexVerdict(statePath: string, roles: ReturnType<typeof loadRoles>, tool: string, input: Record<string, unknown> | undefined): Verdict {
+export function codexVerdict(statePath: string, roles: ReturnType<typeof loadRoles>, tool: string, input: unknown): Verdict {
   const a = activeSource(statePath)
   const source = 'unreadable' in a ? 'email' : a.source
   for (const c of codexCalls(tool, input)) {

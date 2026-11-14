@@ -200,8 +200,16 @@ export function activeSource(statePath: string): ActiveSource {
 }
 
 /** Codex's tool call in the shape guard.ts reads (Bash command / Write path). */
-export function codexCalls(tool: string, input: Record<string, unknown> | undefined): { tool: string; input: Record<string, unknown>; deletes?: boolean }[] {
-  const i = input ?? {}
+export function codexCalls(tool: string, input: unknown): { tool: string; input: Record<string, unknown>; deletes?: boolean }[] {
+  // Codex "code mode" (measured on 0.169, DIVE-8464 live arm): every shell
+  // command rides ONE custom tool, `exec`, whose input is a JS string such as
+  // `text(await tools.exec_command({cmd:"sudo …"}))`. A string input, or a
+  // `code`/`script`/`input` string with no command field, is read as a whole
+  // command text, so the classifier sees what that script would run. That can
+  // hold a harmless script that only names a risky word: the safe side, on an
+  // email turn only.
+  const i: Record<string, unknown> = typeof input === 'string' ? { input } : (input && typeof input === 'object' ? input as Record<string, unknown> : {})
+  const script = [i.input, i.code, i.script].find(v => typeof v === 'string') as string | undefined
   const cmd = Array.isArray(i.command) ? i.command.map(String).join(' ') : typeof i.command === 'string' ? i.command : typeof i.cmd === 'string' ? i.cmd : ''
   const patch = [i.patch, i.input, typeof i.command === 'string' ? i.command : ''].find(v => typeof v === 'string' && /\*\*\* (Begin Patch|Add File|Update File|Delete File)/.test(v)) as string | undefined
   if (patch || /^(apply_patch|Edit|Write|MultiEdit)$/.test(tool)) {
@@ -210,8 +218,33 @@ export function codexCalls(tool: string, input: Record<string, unknown> | undefi
       out.push({ tool: 'Write', input: { file_path: m[2].trim() }, ...(m[1] === 'Delete File' ? { deletes: true } : {}) })
     }
     if (!out.length && typeof i.file_path === 'string') out.push({ tool: 'Write', input: { file_path: i.file_path } })
+    // A code-mode script can patch AND run a command in one call: read both.
+    if (script) for (const command of scriptCommands(script)) out.push({ tool: 'Bash', input: { command } })
     return out
   }
   if (cmd) return [{ tool: 'Bash', input: { command: cmd } }]
+  if (script) return scriptCommands(script).map(command => ({ tool: 'Bash', input: { command } }))
   return []
+}
+
+// The commands a code-mode script would run: every `cmd:`/`command:` string
+// literal ("…", '…' or `…`; an array literal is joined), each read as its own
+// command so the guard's per-command rules apply. A script that calls a shell
+// tool but whose command we cannot read is returned whole: unread is not safe.
+export function scriptCommands(script: string): string[] {
+  const out: string[] = []
+  const lit = '"(?:[^"\\\\]|\\\\.)*"|\'(?:[^\'\\\\]|\\\\.)*\'|`(?:[^`\\\\]|\\\\.)*`'
+  const unq = (q: string): string => {
+    const body = q.slice(1, -1)
+    try { return q[0] === '"' ? JSON.parse(q) : body.replace(/\\(.)/g, '$1') } catch { return body }
+  }
+  // A computed command or a variable is not read here: the fallback below then
+  // returns the whole script for the per-command rules.
+  const re = new RegExp(`\\b(?:cmd|command)\\s*:\\s*(${lit}|\\[(?:\\s*(?:${lit})\\s*,?)*\\])`, 'g')
+  for (const m of script.matchAll(re)) {
+    const v = m[1]!
+    out.push(v.startsWith('[') ? [...v.matchAll(new RegExp(lit, 'g'))].map(x => unq(x[0])).join(' ') : unq(v))
+  }
+  if (!out.length && /exec_command|\bshell\b|spawn|execSync|child_process/.test(script)) out.push(script)
+  return out
 }

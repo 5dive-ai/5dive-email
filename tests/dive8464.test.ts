@@ -202,6 +202,10 @@ describe('codex mail guard', () => {
     }
     expect(codexVerdict(f, roles, 'Bash', bash('rm -rf ./build')).ok).toBe(false)
     expect(codexVerdict(f, roles, 'Bash', bash('ls -la && cat notes.txt')).ok).toBe(true)
+    // DIVE-8464 live arm: Codex 0.169 sends the command inside its code-mode `exec` script.
+    expect(codexVerdict(f, roles, 'exec', 'text(await tools.exec_command({cmd:"sudo touch /root/x"}))').ok).toBe(false)
+    expect(codexVerdict(f, roles, 'exec', { input: 'text(await tools.exec_command({cmd:"sudo touch /root/x"}))' }).ok).toBe(false)
+    expect(codexVerdict(f, roles, 'exec', 'text(await tools.exec_command({cmd:"ls /tmp"}))').ok).toBe(true)
     // Codex's argv form of a shell call.
     expect(codexVerdict(f, roles, 'shell', { command: ['bash', '-lc', 'sudo id'] }).ok).toBe(false)
   })
@@ -224,6 +228,12 @@ describe('codex mail guard', () => {
     const f = stateWith('email')
     const del = '*** Begin Patch\n*** Delete File: src/app.ts\n*** End Patch'
     expect(codexCalls('apply_patch', { input: del })).toEqual([{ tool: 'Write', input: { file_path: 'src/app.ts' }, deletes: true }])
+    // Codex 0.169 code mode: one `exec` tool, a JS string input (DIVE-8464 live arm).
+    const js = 'text(await tools.exec_command({cmd:"sudo touch /root/x"}))'
+    expect(codexCalls('exec', js)).toEqual([{ tool: 'Bash', input: { command: 'sudo touch /root/x' } }])
+    expect(codexCalls('exec', { input: js })).toEqual([{ tool: 'Bash', input: { command: 'sudo touch /root/x' } }])
+    expect(codexCalls('exec', 'await tools.exec_command({cmd: ["sudo", "rm", "-rf", "/x"]})')).toEqual([{ tool: 'Bash', input: { command: 'sudo rm -rf /x' } }])
+    expect(codexCalls('exec', 'const c = "su" + "do"; await tools.exec_command({cmd: c})')[0]!.input.command).toContain('exec_command')
     expect(codexVerdict(f, roles, 'apply_patch', { input: del }).ok).toBe(false)
     const settings = '*** Begin Patch\n*** Update File: /home/agent-mike/.claude/settings.json\n@@\n-a\n+b\n*** End Patch'
     expect(codexVerdict(f, roles, 'apply_patch', { input: settings }).ok).toBe(false)
