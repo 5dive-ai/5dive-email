@@ -21,6 +21,22 @@
 // `sudo 5dive email server setup` and `… connect --self-hosted`:
 //   { domain, hostname, dkim: {selector, key}, relay?: Endpoint,
 //     agents: { <name>: { maildir, uid, gid, pass_sha256 } }, max_bytes? }
+//
+// DIVE-8405, every mail the MX takes, before an agent can see it:
+//   * the sender check: SPF, DKIM and DMARC (mailauth), written on TOP of the
+//     mail as Authentication-Results; any such header a sender wrote in under
+//     this server's name, and any X-OpenAgent-* header, is stripped first. The
+//     channel trusts the topmost one only (mail.ts senderCheck).
+//   * viruses: ClamAV's clamd on this box (OAMAIL_CLAMD, a socket or host:port).
+//     An infected mail is DROPPED, one line in <maildir>/filtered.log; the
+//     channel tells the owner once a day. No clamd = delivered, marked unscanned.
+//   * spam: rspamd on this box (OAMAIL_RSPAMD). Spam lands in the agent's spam
+//     folder (<maildir>/.Spam), never in new/, so it never reaches the agent or
+//     the owner. No rspamd = only the GTUBE test string is caught.
+// Per agent, the owner can switch spam or virus off: agents.<a>.spam/virus=false.
+// Signatures update by themselves when the box is online (freshclam, rspamd's
+// own maps); nothing is sent to a cloud scanner.
+//
 // Outbound mail that cannot go yet waits in /var/lib/5dive/mail/queue and is
 // retried for two days; a final failure lands in the sender's own maildir as a
 // plain note, so the agent learns its mail did not arrive.
@@ -28,11 +44,13 @@
 import { readFileSync, writeFileSync, mkdirSync, renameSync, readdirSync, rmSync, chownSync, existsSync, appendFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { createHash, randomUUID, timingSafeEqual } from 'node:crypto'
-import { resolveMx } from 'node:dns/promises'
+import { resolveMx, resolve as dnsResolve } from 'node:dns/promises'
+import { connect as netConnect } from 'node:net'
+import { authenticate } from 'mailauth'
 import { hostname as osHost } from 'node:os'
 import { SMTPServer } from 'smtp-server'
 import nodemailer from 'nodemailer'
-import { normAddr, domainOf, type Endpoint } from './mail.ts'
+import { normAddr, domainOf, stripHeaders, headerValues, parseAuthResults, rspamdVerdict, builtinSpam, clamdVerdict, filterHeaderValue, FILTER_HEADER, type Endpoint, type SpamVerdict } from './mail.ts'
 
 const CONF = process.env.OAMAIL_CONFIG || '/etc/5dive/mail/server.json'
 const SPOOL = process.env.OAMAIL_SPOOL || '/var/lib/5dive/mail'
@@ -49,7 +67,7 @@ const RETRY_FOR_MS = 48 * 3600_000
 const UNDER_BUN = typeof (globalThis as any).Bun !== 'undefined'
 const NO_TLS = UNDER_BUN ? ['STARTTLS'] : []
 
-type AgentBox = { maildir: string; uid: number; gid: number; pass_sha256: string }
+type AgentBox = { maildir: string; uid: number; gid: number; pass_sha256: string; spam?: boolean; virus?: boolean }
 type Conf = { domain: string; hostname?: string; dkim?: { selector: string; key: string }; relay?: Endpoint; agents: Record<string, AgentBox>; max_bytes?: number }
 
 function loadConf(): Conf {
@@ -79,10 +97,12 @@ export function localAgent(c: Conf, addr: string | null): string | null {
   return Object.prototype.hasOwnProperty.call(c.agents, name) ? name : null
 }
 
-function dropInMaildir(agent: string, raw: Buffer) {
+function dropInMaildir(agent: string, raw: Buffer, folder = '') {
   const a = conf.agents[agent]
-  const tmp = join(a.maildir, 'tmp'), nw = join(a.maildir, 'new')
-  for (const d of [a.maildir, tmp, nw, join(a.maildir, 'cur')]) {
+  const root = folder ? join(a.maildir, folder) : a.maildir
+  if (folder && !existsSync(a.maildir)) { mkdirSync(a.maildir, { recursive: true, mode: 0o700 }); chownSync(a.maildir, a.uid, a.gid) }
+  const tmp = join(root, 'tmp'), nw = join(root, 'new')
+  for (const d of [root, tmp, nw, join(root, 'cur')]) {
     if (!existsSync(d)) { mkdirSync(d, { recursive: true, mode: 0o700 }); chownSync(d, a.uid, a.gid) }
   }
   const name = `${Date.now()}.${randomUUID().slice(0, 12)}.${helo()}`
@@ -99,6 +119,82 @@ function readAll(stream: NodeJS.ReadableStream, limit: number): Promise<Buffer> 
     stream.on('end', () => (n > limit ? reject(Object.assign(new Error('message too large'), { responseCode: 552 })) : resolve(Buffer.concat(parts))))
     stream.on('error', reject)
   })
+}
+
+// ── DIVE-8405: the checks ───────────────────────────────────────────────────
+// OAMAIL_DNS_FILE: the harness's stand-in for DNS ({"<name>": [["txt"]]}), so
+// the sender check runs with no network. Never set on a box.
+const dnsFile = process.env.OAMAIL_DNS_FILE
+const resolver = dnsFile
+  ? async (name: string, rr: string) => {
+      const map = JSON.parse(readFileSync(dnsFile, 'utf8'))
+      const v = map[`${rr} ${name.toLowerCase()}`] ?? (rr === 'TXT' ? map[name.toLowerCase()] : undefined)
+      if (v) return v
+      throw Object.assign(new Error(`no ${rr} ${name}`), { code: 'ENOTFOUND' })
+    }
+  : (name: string, rr: string) => dnsResolve(name, rr as any)
+
+const authLabel = (v: string) => parseAuthResults(v).id === helo().toLowerCase()
+
+async function senderHeaders(raw: Buffer, s: any): Promise<string> {
+  try {
+    const r: any = await authenticate(raw, {
+      ip: String(s.remoteAddress ?? '').replace(/^::ffff:/, ''), helo: s.hostNameAppearsAs || '',
+      sender: s.envelope?.mailFrom ? s.envelope.mailFrom.address : '', mta: helo(), resolver,
+      disableArc: true, disableBimi: true,
+    })
+    return String(r.headers ?? '').replace(/\r?\n/g, '\r\n')
+  } catch (e: any) {
+    log(`sender check failed: ${e?.message ?? e}`)
+    return `Authentication-Results: ${helo()}; dmarc=temperror (the check failed)\r\n`
+  }
+}
+
+const RSPAMD = process.env.OAMAIL_RSPAMD || 'http://127.0.0.1:11333'
+async function spamCheck(raw: Buffer, s: any, rcpts: string[]): Promise<SpamVerdict> {
+  try {
+    const h: Record<string, string> = { IP: String(s.remoteAddress ?? '').replace(/^::ffff:/, ''), Helo: s.hostNameAppearsAs || '', 'MTA-Name': helo() }
+    if (s.envelope?.mailFrom) h.From = s.envelope.mailFrom.address
+    if (rcpts[0]) h.Rcpt = rcpts[0]
+    const r = await fetch(`${RSPAMD}/checkv2`, { method: 'POST', headers: h, body: raw, signal: AbortSignal.timeout(20_000) })
+    if (r.ok) return rspamdVerdict(await r.json())
+    log(`spam filter answered ${r.status}: only the test string is caught`)
+  } catch {}
+  return builtinSpam(raw)
+}
+
+const CLAMD = process.env.OAMAIL_CLAMD || '/run/clamav/clamd.ctl'
+/** ClamAV over INSTREAM; null when no scanner answers. */
+function virusCheck(raw: Buffer): Promise<{ infected: boolean; name?: string } | null> {
+  return new Promise(resolve => {
+    const m = CLAMD.match(/^([^/:]+):(\d+)$/)
+    if (!m && !existsSync(CLAMD)) return resolve(null)
+    const sock = m ? netConnect(Number(m[2]), m[1]) : netConnect(CLAMD)
+    let reply = ''
+    const done = (v: { infected: boolean; name?: string } | null) => { sock.destroy(); resolve(v) }
+    sock.setTimeout(60_000, () => done(null))
+    sock.on('error', () => done(null))
+    sock.on('data', d => { reply += d.toString() })
+    sock.on('end', () => done(clamdVerdict(reply)))
+    sock.on('connect', () => {
+      sock.write('zINSTREAM\0')
+      for (let i = 0; i < raw.length; i += 64 * 1024) {
+        const c = raw.subarray(i, i + 64 * 1024), n = Buffer.alloc(4)
+        n.writeUInt32BE(c.length)
+        sock.write(n); sock.write(c)
+      }
+      sock.write(Buffer.alloc(4))
+    })
+  })
+}
+
+function noteFiltered(agent: string, kind: 'virus' | 'spam', from: string, detail: string) {
+  const a = conf.agents[agent]
+  try {
+    const f = join(a.maildir, 'filtered.log')
+    appendFileSync(f, `${new Date().toISOString()}\t${kind}\t${from.replace(/\s/g, '')}\t${detail.replace(/\s+/g, ' ').slice(0, 120)}\n`, { mode: 0o600 })
+    chownSync(f, a.uid, a.gid)
+  } catch (e) { log(`could not note a filtered mail for ${agent}: ${e}`) }
 }
 
 const stamp = (peer: string, by: string) => Buffer.from(`Received: from ${peer.replace(/[^0-9a-fA-F.:]/g, '')} by ${by} with ESMTP; ${new Date().toUTCString()}\r\n`)
@@ -119,10 +215,24 @@ const mx = new SMTPServer({
   },
   async onData(stream, session, cb) {
     try {
-      const raw = Buffer.concat([stamp(session.remoteAddress, helo()), await readAll(stream, maxBytes())])
-      const to = session.envelope.rcptTo.map(r => localAgent(conf, normAddr(r.address))).filter(Boolean) as string[]
-      for (const a of new Set(to)) dropInMaildir(a, raw)
-      log(`in\tfrom=${session.remoteAddress}\tto=${[...new Set(to)].join(',')}\tbytes=${raw.length}`)
+      // What a sender wrote in under OUR name is not ours: stripped before anything reads it.
+      const body = stripHeaders(await readAll(stream, maxBytes()), (n, v) => n.startsWith('x-openagent-') || (n === 'authentication-results' && authLabel(v)))
+      const to = [...new Set(session.envelope.rcptTo.map(r => localAgent(conf, normAddr(r.address))).filter(Boolean) as string[])]
+      const from = normAddr(headerValues(body, 'from')[0]) ?? (session.envelope.mailFrom ? String(session.envelope.mailFrom.address) : '-')
+      const auth = await senderHeaders(body, session)
+      const wantVirus = to.some(a => conf.agents[a].virus !== false), wantSpam = to.some(a => conf.agents[a].spam !== false)
+      const virus = wantVirus ? await virusCheck(body) : null
+      const spam = wantSpam && !virus?.infected ? await spamCheck(body, session, session.envelope.rcptTo.map(r => r.address)) : null
+      const fh = (a: string) => Buffer.from(`${FILTER_HEADER}: ${filterHeaderValue({ spam: conf.agents[a].spam === false ? null : spam, virus: virus && conf.agents[a].virus !== false ? 'clean' : 'unscanned' })}\r\n`)
+      const where: string[] = []
+      for (const a of to) {
+        if (virus?.infected && conf.agents[a].virus !== false) { noteFiltered(a, 'virus', from, virus.name ?? ''); where.push(`${a}:virus-dropped`); continue }
+        const raw = Buffer.concat([stamp(session.remoteAddress, helo()), fh(a), Buffer.from(auth), body])
+        if (spam?.spam && conf.agents[a].spam !== false) { dropInMaildir(a, raw, '.Spam'); noteFiltered(a, 'spam', from, `score ${spam.score ?? 'test'}`); where.push(`${a}:spam`); continue }
+        dropInMaildir(a, raw)
+        where.push(a)
+      }
+      log(`in\tfrom=${session.remoteAddress}\tto=${where.join(',')}\tbytes=${body.length}${virus ? '' : '\tunscanned'}`)
       cb()
     } catch (e: any) {
       log(`in refused: ${e?.message ?? e}`)
@@ -166,9 +276,11 @@ const sub = new SMTPServer({
       const from = normAddr(s.envelope.mailFrom && s.envelope.mailFrom.address)!
       const rcpts = s.envelope.rcptTo.map(r => normAddr(r.address)).filter(Boolean) as string[]
       const local = rcpts.filter(r => localAgent(conf, r))
-      for (const r of local) dropInMaildir(localAgent(conf, r)!, Buffer.concat([stamp('127.0.0.1', helo()), raw]))
+      // A colleague agent on this box logged in as itself: that is the sender check.
+      const clean = stripHeaders(raw, n => n.startsWith('x-openagent-'))
+      for (const r of local) dropInMaildir(localAgent(conf, r)!, Buffer.concat([stamp('127.0.0.1', helo()), Buffer.from(`Authentication-Results: ${helo()}; auth=pass smtp.auth=${from}\r\n`), clean]))
       const away = rcpts.filter(r => !localAgent(conf, r))
-      if (away.length) enqueue({ id: randomUUID(), from, to: away, raw: raw.toString('base64'), first: Date.now(), tries: 0, next: 0 })
+      if (away.length) enqueue({ id: randomUUID(), from, to: away, raw: clean.toString('base64'), first: Date.now(), tries: 0, next: 0 })
       log(`out\tagent=${s.user}\tlocal=${local.length}\tqueued=${away.length}`)
       cb()
       void drain()
@@ -257,6 +369,8 @@ function bounce(j: Job, rcpts: string[], why: string) {
     `Date: ${new Date().toUTCString()}`,
     `Message-ID: <${randomUUID()}@${conf.domain}>`,
     'Auto-Submitted: auto-replied',
+    // Only this server writes it: the MX and submission strip any X-OpenAgent-* a sender wrote.
+    'X-OpenAgent-Bounce: 1',
     'Content-Type: text/plain; charset=utf-8',
     '',
     `Your mail to ${rcpts.join(', ')} could not be delivered: ${why.slice(0, 500)}`,

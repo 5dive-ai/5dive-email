@@ -9,6 +9,7 @@
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.0.0",
     "imapflow": "^1.7.8",
+    "mailauth": "8.0.4",
     "mailparser": "^3.14.3",
     "nodemailer": "^6.10.1",
     "smtp-server": "^3.21.4"
