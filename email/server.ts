@@ -29,6 +29,14 @@
 // is told to the owner once a day.
 //
 // Config: ~/.claude/channels/email/config.json (mail.ts, Config).
+//
+// DIVE-8464, every enterprise setup:
+//   * Claude Code on a Claude plan: the channel notification above.
+//   * Claude Code on the firm's own AI (a custom ANTHROPIC_BASE_URL), where
+//     Claude Code refuses channels: the mail is typed into the seat's own
+//     session instead (channelroute.ts), the Telegram and dashboard fallback.
+//   * Codex on a ChatGPT account: CODEX_DISPATCHER_ADAPTER=email, the 5dive
+//     dispatcher's spool in and out (codex.ts). No MCP there.
 
 import { readFileSync, writeFileSync, mkdirSync, appendFileSync, renameSync, readdirSync, rmSync, statSync, watch, existsSync } from 'node:fs'
 import { homedir } from 'node:os'
@@ -41,7 +49,11 @@ import { ListToolsRequestSchema, CallToolRequestSchema } from '@modelcontextprot
 import { ImapFlow } from 'imapflow'
 import { simpleParser } from 'mailparser'
 import nodemailer from 'nodemailer'
+import { execFile } from 'node:child_process'
+import { promisify } from 'node:util'
 import { installLifecycle, recordLifecycle } from './lifecycle.ts'
+import { makeRouteProbe, makeSessionInjector, formatInjection } from './channelroute.ts'
+import { adapterPayload, adapterStateDir, writeInbox, makeOutboxDrainer, PermanentSendError, type OutMail } from './codex.ts'
 import {
   parseConfig, readState, trimState, remember, normAddr, threadRoot, chatIdOf, replySubject, nextReferences,
   renderInbound, gateFor, inboundGate, capLeft, countSent, afterAnswer, mayReach, SHUT_LINE, knockFileArgs, knockFiled,
@@ -60,6 +72,10 @@ const MAX_FILE = 25 * 1024 * 1024
 const MAX_MAIL = 40 * 1024 * 1024
 const MAX_OUT_FILES = 10
 const AGENT = basename(homedir()).replace(/^agent-/, '')
+// DIVE-8464: a Codex seat's dispatcher runs this plugin as its email adapter.
+const ADAPTER = process.env.CODEX_DISPATCHER_ADAPTER === 'email'
+const DISPATCHER_DIR = adapterStateDir()
+const DISPATCHER_OUTBOX = join(DISPATCHER_DIR, 'outbox', 'email')
 
 function loadConfig(): Config | null {
   try {
@@ -105,7 +121,7 @@ async function assertReachable(host: string) {
 
 // ── MCP ────────────────────────────────────────────────────────────────────
 const mcp = new Server(
-  { name: 'email', version: '0.1.0' },
+  { name: 'email', version: '0.2.0' },
   {
     capabilities: { tools: {}, experimental: { 'claude/channel': {} } },
     instructions: [
@@ -165,10 +181,76 @@ class DeliverError extends Error {}
 // For notes that have nowhere to go back to (owner answers, bounces): log and move on.
 function tell(content: string, meta: Record<string, string>) { void deliver(content, meta).catch(() => {}) }
 function deliver(content: string, meta: Record<string, string>): Promise<void> {
-  return mcp.notification({ method: 'notifications/claude/channel', params: { content, meta } }).catch((e: unknown) => {
+  if (ADAPTER) {
+    // A spool write that fails (disk full, no dir) leaves the mail unread on the
+    // server, exactly like a dropped connection: the next pass tries it again.
+    try {
+      writeInbox(DISPATCHER_DIR, adapterPayload(content, meta, `${Date.now()}-${randomUUID().slice(0, 8)}`))
+      return Promise.resolve()
+    } catch (e) {
+      say(`deliver to the Codex dispatcher failed: ${e}`)
+      return Promise.reject(new DeliverError(String(e)))
+    }
+  }
+  return deliverToSession(content, meta).catch((e: unknown) => {
     say(`deliver failed: ${e}`)
     throw new DeliverError(String(e))
   })
+}
+
+// DIVE-8464: where a mail goes on Claude Code. When this session asked for the
+// email channel and Claude Code REFUSED it (the firm's own AI server behind a
+// custom base URL never gets the channels flag), a notification is dropped
+// unheard, so the mail is typed into the seat's own pane. Every other case
+// (bound, an org's own policy, any other skip, no decision yet) keeps the
+// notification: one delivery, never two. channelroute.ts has the evidence.
+const ROUTE_BOOT_MS = Date.now()
+const ROUTE_MARKER = `email channel: route-marker ${process.pid}.${ROUTE_BOOT_MS}`
+if (!ADAPTER) process.stderr.write(`${ROUTE_MARKER}\n`)
+const inboundRoute = makeRouteProbe({
+  marker: ROUTE_MARKER,
+  bootPpid: process.ppid,
+  cacheRoot: join(homedir(), '.cache', 'claude-cli-nodejs'),
+  bootMs: ROUTE_BOOT_MS,
+})
+let lastRouteNoted = ''
+async function deliverToSession(content: string, meta: Record<string, string>): Promise<void> {
+  let route = inboundRoute.route()
+  // A mail that beats Claude Code's gate decision at boot waits for it
+  // (bounded) rather than guessing: a wrong guess is a lost or a doubled mail.
+  for (let i = 0; i < 20 && route === 'mcp' && inboundRoute.pending(); i++) {
+    await new Promise(r => setTimeout(r, 500))
+    route = inboundRoute.route()
+  }
+  const why = `${route} (${inboundRoute.describe()})`
+  if (why !== lastRouteNoted) {
+    lastRouteNoted = why
+    say(`inbound route ${why}`)
+    recordLifecycle(STATE_DIR, 'delivery', 'email', `inbound route ${why}`)
+  }
+  if (route === 'inject') {
+    try {
+      await injectIntoSession(formatInjection(content, meta))
+      return
+    } catch (err) {
+      say(`session inject failed, falling back to the channel notification: ${err}`)
+    }
+  }
+  await mcp.notification({ method: 'notifications/claude/channel', params: { content, meta } })
+}
+let sessionInjector: ((text: string) => Promise<void>) | null = null
+function injectIntoSession(text: string): Promise<void> {
+  if (!sessionInjector) {
+    const user = process.env.USER ?? process.env.LOGNAME ?? ''
+    const execFileP = promisify(execFile)
+    sessionInjector = makeSessionInjector({
+      tmuxBin: ['/usr/bin/tmux', '/usr/local/bin/tmux', '/bin/tmux'].find(p => existsSync(p)) ?? 'tmux',
+      socket: (process.env.TMUX ?? '').split(',')[0] ?? '',
+      target: process.env.TMUX_PANE || (user.startsWith('agent-') ? `${user}:0` : ''),
+      exec: (bin, args) => execFileP(bin, args),
+    })
+  }
+  return sessionInjector(text)
 }
 
 // ── sending ──────────────────────────────────────────────────────────────────
@@ -291,6 +373,19 @@ async function outbound(o: Out): Promise<string> {
     return `HELD (${id}): ${who} never wrote to you, so this mail waits for your owner's OK, but the owner could not be paged: ${unreached.join('; ')}. Tell your owner on their channel; they approve with: sudo 5dive people knock answer <number> allow (see: 5dive people ls).`
   }
   return `HELD (${id}): ${who} never wrote to you, so this mail waits for your owner's OK. They got a card with Allow / No; the mail goes out by itself on Allow and you will get a note either way. Do not resend it.`
+}
+
+// DIVE-8464: a Codex agent's answer (the dispatcher's outbox), sent like the
+// reply tool sends: same thread, same doors, same daily cap. Never retried:
+// no thread, a refused address, an unusable file. Retried: everything else.
+async function sendAnswer(m: OutMail): Promise<string> {
+  if (!cfg) throw new Error('email is not connected for this agent')
+  const t = state.threads[m.chat]
+  if (!t) throw new PermanentSendError(`no email thread ${m.chat}`)
+  let files: string[]
+  try { files = checkFiles(m.files) } catch (e: any) { throw new PermanentSendError(e?.message ?? String(e)) }
+  if (gateFor(cfg, state, t.with) === 'refused') throw new PermanentSendError(`the owner said no to mailing ${t.with}`)
+  return outbound({ to: [t.with], cc: [], subject: replySubject(t.subject), text: m.text, files, chat: m.chat })
 }
 
 mcp.setRequestHandler(CallToolRequestSchema, async (req: any) => {
@@ -714,14 +809,34 @@ function start() {
   else void maildirLoop()
 }
 
-installLifecycle({ channel: 'email', stateDir: STATE_DIR })
-// Read mail only once Claude is connected AND has had time to register its
-// channel listener. Measured on a live box (DIVE-8315): starting before
-// connect delivered a waiting mail 40 ms after boot, Claude dropped it, and the
-// file was already marked read, so the sender's mail was lost. 5 s is the
-// family's measured margin (wiki cc-mcp-channel-notification-race): a resolved
-// notification() is no proof Claude saw it, so no shorter wait can be checked.
-let started = false
-const startOnce = () => { if (!started) { started = true; start() } }
-mcp.oninitialized = () => { setTimeout(startOnce, 5_000) }
-await mcp.connect(new StdioServerTransport())
+if (ADAPTER) {
+  // No MCP parent here: the Codex dispatcher supervises this process (stdin is
+  // /dev/null) and respawns it when it exits, so it never exits on its own.
+  installLifecycle({ channel: 'email', stateDir: STATE_DIR, adapter: true })
+  mkdirSync(DISPATCHER_OUTBOX, { recursive: true, mode: 0o700 })
+  recordLifecycle(STATE_DIR, 'start', 'email', `codex dispatcher adapter: spool ${DISPATCHER_DIR}`)
+  say(`Codex dispatcher adapter active, spool ${DISPATCHER_DIR}`)
+  start()
+  if (cfg) {
+    const outbox = makeOutboxDrainer({ dir: DISPATCHER_OUTBOX, send: sendAnswer, log: say })
+    try { watch(DISPATCHER_OUTBOX, () => void outbox.drain()) } catch (e) { say(`outbox watch failed: ${e}`) }
+    void outbox.drain()
+    // Not unref'd: this keeps an adapter alive on purpose, configured or not
+    // (an exit would only be respawned, with a crash record each time).
+    setInterval(() => void outbox.drain(), 5_000)
+  } else {
+    setInterval(() => {}, 60 * 60_000)
+  }
+} else {
+  installLifecycle({ channel: 'email', stateDir: STATE_DIR })
+  // Read mail only once Claude is connected AND has had time to register its
+  // channel listener. Measured on a live box (DIVE-8315): starting before
+  // connect delivered a waiting mail 40 ms after boot, Claude dropped it, and the
+  // file was already marked read, so the sender's mail was lost. 5 s is the
+  // family's measured margin (wiki cc-mcp-channel-notification-race): a resolved
+  // notification() is no proof Claude saw it, so no shorter wait can be checked.
+  let started = false
+  const startOnce = () => { if (!started) { started = true; start() } }
+  mcp.oninitialized = () => { setTimeout(startOnce, 5_000) }
+  await mcp.connect(new StdioServerTransport())
+}
