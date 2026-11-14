@@ -40,6 +40,8 @@ export type Config = {
   /** Mails a day, all recipients counted once per mail (default 50). */
   daily_cap?: number
   poll_seconds?: number
+  /** true (default) = only a mail whose sender is CONFIRMED (SPF/DKIM/DMARC, see senderCheck) counts as a colleague, a listed or a known sender; any other mail waits at the door. */
+  check_sender?: boolean
 }
 
 const HOST_RX = /^[A-Za-z0-9]([A-Za-z0-9.-]{0,251}[A-Za-z0-9])?$/
@@ -184,6 +186,12 @@ export type State = {
   /** Inbound mail from unknown senders, waiting for the owner (never shown to the agent). */
   held_in: Record<string, HeldIn>
   sent: { day: string; n: number }
+  /** DIVE-8405: when the last "someone new wrote" card was filed, and when the owner last answered one. */
+  door_carded_at?: string
+  door_answered_at?: string
+  /** The newest filtered.log time already told to the owner, and when they were last told. */
+  filter_told_upto?: string
+  filter_told_at?: string
 }
 
 export function emptyState(): State {
@@ -198,6 +206,7 @@ export function readState(raw: any): State {
   if (raw.held && typeof raw.held === 'object') s.held = raw.held
   if (raw.held_in && typeof raw.held_in === 'object') s.held_in = raw.held_in
   if (raw.sent && typeof raw.sent.day === 'string' && Number.isInteger(raw.sent.n)) s.sent = raw.sent
+  for (const k of ['door_carded_at', 'door_answered_at', 'filter_told_upto', 'filter_told_at'] as const) if (typeof raw[k] === 'string') s[k] = raw[k]
   if (typeof raw.uid_validity === 'string') s.uid_validity = raw.uid_validity
   if (Number.isInteger(raw.last_uid)) s.last_uid = raw.last_uid
   return s
@@ -257,16 +266,31 @@ export function gateFor(cfg: Config, s: State, addr: string): Gate {
 // stays unknown (their next mail is dropped too). The agent's own domain, the
 // owner's allowed list and anyone the agent already mailed pass. The owner can
 // switch it off per agent (approve_inbound:false).
-export function inboundGate(cfg: Config, s: State, addr: string): Gate {
+// DIVE-8405: the door trusts the From line only when the sender is confirmed
+// (senderCheck). A mail whose sender could not be confirmed is never "free" as
+// a colleague, a listed or a known sender: it waits like a stranger's, and its
+// card says so. `check` is that verdict; omitted = not checked (owner switch off).
+export function inboundGate(cfg: Config, s: State, addr: string, check?: SenderCheck): Gate {
   if (s.refused.includes(addr)) return 'refused'
   if (cfg.approve_inbound === false) return 'free'
+  if (check && !check.ok && cfg.check_sender !== false) return 'ask'
   if (s.known.includes(addr) || s.approved.includes(addr)) return 'free'
   if (freeDomains(cfg).includes(domainOf(addr)) || preAllowed(cfg, addr)) return 'free'
   return 'ask'
 }
 
 /** A mail held at the door: its raw file waits in the spool until the owner answers. */
-export type HeldIn = { id: string; from: string; file: string; kid: number | null; tried: string; at: string }
+export type HeldIn = {
+  id: string; from: string; file: string; kid: number | null; tried: string; at: string
+  /** The sender could not be confirmed: its card says so, and only the owner's answer about THIS hold releases it. */
+  unconfirmed?: string
+  /** The owner answered Allow while this mail waited. */
+  released?: boolean
+  /** The owner answered No on THIS mail's card (an unconfirmed sender): drop it, refuse nobody. */
+  dropped?: boolean
+  /** Its card waits for the hourly slot (doorSlotFree). */
+  paced?: boolean
+}
 export const MAX_HELD_IN = 200
 
 export const DEFAULT_CAP = 50
@@ -335,7 +359,7 @@ export function mayReach(addrs: string[], paths = localOnlyPaths()): boolean {
 // No = the mail is dropped and the address stays refused. The CLI drops the
 // answer into this agent's state dir as knocks/<kid>.json.
 
-export type KnockKind = 'send' | 'receive'
+export type KnockKind = 'send' | 'receive' | 'receive_unconfirmed'
 export function knockFileArgs(addr: string, name = '', kind: KnockKind = 'send'): string[] | null {
   const a = normAddr(addr)
   if (!a || a.length > 120) return null
@@ -393,4 +417,203 @@ export function voiceLine(name: string, heard: { text: string } | { why: string 
     return `[Voice message "${name}" — transcript, heard on this server:]\n${t.length > 8000 ? t.slice(0, 8000) + ' [… cut]' : t}`
   }
   return `[Voice message "${name}" attached, not transcribed: ${heard.why}]`
+}
+
+// ── DIVE-8405: is the sender real? ───────────────────────────────────────────
+// lodar 11-13: «will there be spam filter and how will we protect from the
+// prompting hacks? … viruses and phishing … whitelisting mostly?» The list is
+// only as strong as the From line it matches, and a From line is free text. So
+// a mail counts as FROM an address only when the server that took it confirmed
+// it, in its Authentication-Results header (RFC 8601):
+//   * own server (mode local): mailserver.ts checks SPF, DKIM and DMARC itself
+//     on receipt and puts its result on TOP of the mail (and strips any
+//     look-alike header a sender wrote in);
+//   * the firm's mailbox (mode imap): Google / Microsoft / the firm's server put
+//     theirs on top the same way; the topmost one is the provider's.
+// Confirmed = DMARC pass, or a DKIM signature or an SPF pass whose domain matches
+// the From domain (relaxed alignment: same organisational domain), or a sender
+// that logged in as that very address (auth=pass, a colleague agent on this box).
+
+export type SenderCheck = { ok: boolean; why: string }
+
+/** The raw header block of a mail, without the body. */
+export function headerBlock(raw: Buffer | string): string {
+  const s = typeof raw === 'string' ? raw : raw.subarray(0, 256 * 1024).toString('latin1')
+  const m = s.match(/\r?\n\r?\n/)
+  return m ? s.slice(0, m.index) : s
+}
+
+/** Every value of a header, unfolded, topmost first. */
+export function headerValues(raw: Buffer | string, name: string): string[] {
+  const out: string[] = []
+  const want = name.toLowerCase()
+  for (const h of headerBlock(raw).split(/\r?\n(?![ \t])/)) {
+    const i = h.indexOf(':')
+    if (i > 0 && h.slice(0, i).trim().toLowerCase() === want) out.push(h.slice(i + 1).replace(/\r?\n[ \t]+/g, ' ').trim())
+  }
+  return out
+}
+
+/** The mail with every header `drop` matches removed (the body untouched). */
+export function stripHeaders(raw: Buffer, drop: (name: string, value: string) => boolean): Buffer {
+  const s = raw.toString('latin1')
+  const m = s.match(/\r?\n\r?\n/)
+  const head = m ? s.slice(0, m.index) : s
+  const rest = m ? s.slice(m.index) : ''
+  const kept = head.split(/(?<=\n)(?![ \t])/).filter(h => {
+    const i = h.indexOf(':')
+    return !(i > 0 && drop(h.slice(0, i).trim().toLowerCase(), h.slice(i + 1).replace(/\r?\n[ \t]+/g, ' ').trim()))
+  })
+  return Buffer.from(kept.join('') + rest, 'latin1')
+}
+
+const TWO_LEVEL = /^(co|com|net|org|gov|ac|edu|ltd|plc|or|ne|go|gv)$/
+/** The organisational domain, close enough for alignment: mail.firm.co.uk → firm.co.uk. */
+export function orgDomain(d: string): string {
+  const p = d.toLowerCase().replace(/\.$/, '').split('.').filter(Boolean)
+  if (p.length <= 2) return p.join('.')
+  const n = p.length >= 3 && p[p.length - 1].length === 2 && TWO_LEVEL.test(p[p.length - 2]) ? 3 : 2
+  return p.slice(-n).join('.')
+}
+const aligned = (a: string, b: string) => !!a && !!b && orgDomain(a) === orgDomain(b)
+
+/** One Authentication-Results value: its authserv-id and its method results. */
+export function parseAuthResults(v: string): { id: string; results: { method: string; result: string; props: Record<string, string> }[] } {
+  let t = v
+  for (let i = 0; i < 4; i++) t = t.replace(/\([^()]*\)/g, ' ') // comments, nested a little
+  const parts = t.split(';').map(x => x.trim()).filter(Boolean)
+  let id = ''
+  if (parts.length && !/^[a-z0-9_.-]+\s*=/i.test(parts[0])) id = parts.shift()!.split(/\s+/)[0].toLowerCase()
+  const results = parts.map(p => {
+    const toks = p.split(/\s+/).filter(Boolean)
+    const [method, result] = (toks.shift() ?? '').toLowerCase().split('=')
+    const props: Record<string, string> = {}
+    for (const k of toks) { const j = k.indexOf('='); if (j > 0) props[k.slice(0, j).toLowerCase()] = k.slice(j + 1).replace(/^"|"$/g, '').toLowerCase() }
+    return { method: method ?? '', result: result ?? '', props }
+  }).filter(r => r.method && r.result)
+  return { id, results }
+}
+
+/** Is the From address confirmed by this (topmost) Authentication-Results value? */
+export function senderCheck(authResults: string | undefined, from: string): SenderCheck {
+  if (!authResults) return { ok: false, why: 'the mail carries no sender check' }
+  const fd = domainOf(from)
+  const { results } = parseAuthResults(authResults)
+  const dom = (s: string | undefined) => (s ?? '').replace(/^.*@/, '')
+  for (const r of results) {
+    if (r.method === 'dmarc' && r.result === 'pass' && (!r.props['header.from'] || aligned(r.props['header.from'], fd))) return { ok: true, why: 'dmarc=pass' }
+    if (r.method === 'dkim' && r.result === 'pass' && aligned(r.props['header.d'] || dom(r.props['header.i']), fd)) return { ok: true, why: 'dkim=pass' }
+    if (r.method === 'spf' && r.result === 'pass' && aligned(dom(r.props['smtp.mailfrom']), fd)) return { ok: true, why: 'spf=pass' }
+    if (r.method === 'auth' && r.result === 'pass' && r.props['smtp.auth'] === from) return { ok: true, why: 'auth=pass' }
+  }
+  const dm = results.find(r => r.method === 'dmarc')
+  if (dm && dm.result === 'fail') return { ok: false, why: `${fd} says this server may not send its mail (dmarc=fail)` }
+  if (results.some(r => /^(temperror|permerror)$/.test(r.result))) return { ok: false, why: 'the sender check could not finish (DNS)' }
+  return { ok: false, why: `nothing proves the mail came from ${fd}` }
+}
+
+// ── DIVE-8405: spam, viruses, phishing (own server) ──────────────────────────
+// mailserver.ts asks a filter running ON THE BOX (rspamd, ClamAV: no mail
+// leaves the server) and writes what it found on top of the mail in one header
+// of its own, X-OpenAgent-Filter, after stripping any a sender wrote in.
+export const FILTER_HEADER = 'x-openagent-filter'
+export const GTUBE = 'XJS*C4JDBQADN1.NSBN3*2IDNEN*GTUBE-STANDARD-ANTI-UBE-TEST-EMAIL*C.34X'
+
+export type SpamVerdict = { spam: boolean; score: number | null; phishing: string[]; by: string }
+/** rspamd's /checkv2 answer → our verdict. Spam = any action that would not let it through plainly. */
+export function rspamdVerdict(j: any): SpamVerdict {
+  const action = String(j?.action ?? 'no action')
+  const symbols = j?.symbols && typeof j.symbols === 'object' ? Object.keys(j.symbols) : []
+  const phishing = symbols.filter(s => /PHISH|SPOOF|FREEMAIL_REPLYTO_NEQ|HTML_SHORT_LINK|REDIRECTOR|OMOGRAPH|URIBL|DBL|SURBL|SUSPICIOUS/.test(s)).slice(0, 5)
+  return { spam: /^(reject|add header|rewrite subject)$/.test(action), score: Number.isFinite(Number(j?.score)) ? Number(j.score) : null, phishing, by: 'rspamd' }
+}
+/** No filter running: only the industry's test string is caught (the honest floor, not a spam filter). */
+export function builtinSpam(raw: Buffer): SpamVerdict {
+  return { spam: raw.includes(GTUBE), score: null, phishing: [], by: 'none' }
+}
+/** clamd's INSTREAM reply. */
+export function clamdVerdict(reply: string): { infected: boolean; name?: string } | null {
+  const t = reply.replace(/\0/g, '').trim()
+  const m = t.match(/^stream: (.+) FOUND$/)
+  if (m) return { infected: true, name: m[1].slice(0, 120) }
+  if (/^stream: OK$/.test(t)) return { infected: false }
+  return null
+}
+export function filterHeaderValue(f: { spam: SpamVerdict | null; virus: 'clean' | 'unscanned' }): string {
+  const parts = [`spam=${f.spam ? (f.spam.by === 'none' ? 'unchecked' : `${f.spam.score ?? '?'}`) : 'off'}`, `virus=${f.virus}`]
+  if (f.spam?.phishing.length) parts.push(`phishing=${f.spam.phishing.join(',')}`)
+  return parts.join('; ')
+}
+export function parseFilterHeader(v: string | undefined): { virus: string; spam: string; phishing: string[] } | null {
+  if (!v) return null
+  const kv: Record<string, string> = {}
+  for (const p of v.split(';')) { const i = p.indexOf('='); if (i > 0) kv[p.slice(0, i).trim()] = p.slice(i + 1).trim() }
+  return { virus: kv.virus ?? '', spam: kv.spam ?? '', phishing: (kv.phishing ?? '').split(',').filter(Boolean) }
+}
+
+// Phishing signs the channel finds itself, on any route: a link that SHOWS one
+// site and GOES to another, a look-alike of the agent's own domain, a name that
+// carries a different address. Marked to the agent, never a reason to hold.
+function editDistance(a: string, b: string): number {
+  if (Math.abs(a.length - b.length) > 2) return 3
+  const d = Array.from({ length: a.length + 1 }, (_, i) => [i, ...Array(b.length).fill(0)])
+  for (let j = 1; j <= b.length; j++) d[0][j] = j
+  for (let i = 1; i <= a.length; i++) for (let j = 1; j <= b.length; j++) d[i][j] = Math.min(d[i - 1][j] + 1, d[i][j - 1] + 1, d[i - 1][j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1))
+  return d[a.length][b.length]
+}
+const hostOf = (u: string) => { try { return new URL(/^[a-z][a-z0-9+.-]*:/i.test(u) ? u : `http://${u}`).hostname.toLowerCase().replace(/^www\./, '') } catch { return '' } }
+export function lookalike(d: string, real: string): boolean {
+  const a = orgDomain(d), b = orgDomain(real)
+  if (!a || !b || a === b) return false
+  if (a.includes('xn--')) return true
+  const la = a.split('.')[0], lb = b.split('.')[0]
+  return la.length >= 4 && editDistance(la, lb) <= 2
+}
+export function phishingSigns(m: { from: string; fromName: string; html: string; ownDomain: string; links?: number }): string[] {
+  const out: string[] = []
+  const fd = domainOf(m.from)
+  const named = (m.fromName.match(/[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}/i) ?? [])[0]?.toLowerCase()
+  if (named && named !== m.from) out.push(`the sender's name shows ${named}, but the mail is from ${m.from}`)
+  if (lookalike(fd, m.ownDomain)) out.push(`the sender's domain ${fd} looks like ${m.ownDomain} but is not`)
+  else if (fd.includes('xn--')) out.push(`the sender's domain ${fd} uses look-alike letters`)
+  let n = 0
+  for (const a of (m.html || '').matchAll(/<a\b[^>]*href\s*=\s*["']?([^"'\s>]+)[^>]*>([\s\S]*?)<\/a>/gi)) {
+    n++
+    const href = a[1], shown = a[2].replace(/<[^>]*>/g, '').trim()
+    const hh = hostOf(href)
+    if (!hh || out.length >= 3) continue
+    if (/^\d+\.\d+\.\d+\.\d+$/.test(hh)) { out.push(`a link goes to a bare address (${hh})`); continue }
+    const sm = shown.match(/^(?:https?:\/\/)?((?:[a-z0-9-]+\.)+[a-z]{2,})(?:[\/:?#]\S*)?$/i)
+    if (sm && orgDomain(sm[1].replace(/^www\./, '')) !== orgDomain(hh)) out.push(`a link shows ${sm[1].toLowerCase()} but goes to ${hh}`)
+    else if (hh.includes('xn--') || lookalike(hh, m.ownDomain)) out.push(`a link goes to a look-alike site (${hh})`)
+  }
+  if (n >= 25 && out.length < 3) out.push(`the mail is mostly links (${n})`)
+  return out.slice(0, 3)
+}
+
+// ── DIVE-8405: the owner hears about a blocked virus once a day, not per mail ─
+// mailserver.ts appends one line per filtered mail to <maildir>/filtered.log:
+//   <iso time>\tvirus|spam\t<from>\t<detail>
+export type Filtered = { at: string; kind: 'virus' | 'spam'; from: string; detail: string }
+export function readFiltered(text: string, after = ''): Filtered[] {
+  return text.split('\n').map(l => l.split('\t')).filter(p => p.length >= 3 && (p[1] === 'virus' || p[1] === 'spam') && p[0] > after)
+    .map(p => ({ at: p[0], kind: p[1] as 'virus' | 'spam', from: p[2], detail: p[3] ?? '' }))
+}
+export const DAY_MS = 24 * 3600_000
+/** The one line for the owner, or null when nothing is owed yet. */
+export function ownerDigest(agent: string, f: Filtered[], toldAt: string | undefined, now = Date.now()): string | null {
+  const v = f.filter(x => x.kind === 'virus')
+  if (!v.length) return null
+  if (toldAt && now - Date.parse(toldAt) < DAY_MS) return null
+  const who = [...new Set(v.map(x => x.from))].slice(0, 3).join(', ')
+  const spam = f.filter(x => x.kind === 'spam').length
+  return `${agent}'s email blocked ${v.length} mail${v.length > 1 ? 's' : ''} with a virus (from ${who}${new Set(v.map(x => x.from)).size > 3 ? ' and others' : ''}). ${agent} never saw ${v.length > 1 ? 'them' : 'it'}.${spam ? ` ${spam} spam mail${spam > 1 ? 's' : ''} went to the spam folder.` : ''}`
+}
+
+/** May a "someone new wrote" card go out now? At most one an hour; the owner's answer frees the next at once. */
+export const DOOR_EVERY_MS = 3600_000
+export function doorSlotFree(s: State, now = Date.now(), every = DOOR_EVERY_MS): boolean {
+  if (!s.door_carded_at) return true
+  if (s.door_answered_at && s.door_answered_at >= s.door_carded_at) return true
+  return now - Date.parse(s.door_carded_at) >= every
 }

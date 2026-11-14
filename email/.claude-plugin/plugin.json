@@ -47,7 +47,8 @@
         "sender": "email",
         "cards": {
           "send": "{agent} wants to email {sender}, who has never written to {agent}. The mail waits until you answer.",
-          "receive": "{sender} emailed {agent} for the first time. {agent} has not seen it. Let it through?"
+          "receive": "{sender} emailed {agent} for the first time. {agent} has not seen it. Let it through?",
+          "receive_unconfirmed": "{sender} emailed {agent}, but the mail could not be confirmed as really from them: it may be faked. {agent} has not seen it. Let it through?"
         }
       }
     }

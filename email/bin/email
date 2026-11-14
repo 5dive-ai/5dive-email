@@ -14,11 +14,16 @@
 #       <agent>@<domain> on this box's own mail server (run `server setup` first).
 #   status <agent>
 #   disconnect <agent>
-#   gate <agent> [send|inbound] on|off
+#   gate <agent> [send|inbound|sender|spam|virus] on|off
 #                             send (default): a first mail TO a new outside address
 #                             waits for the owner's tap; inbound: a first mail FROM
 #                             someone unknown is held, unseen by the agent, until the
 #                             owner taps Allow. Both on by default.
+#                             sender (DIVE-8405): a mail counts as from a colleague or
+#                             a listed address only when the sender is confirmed
+#                             (SPF/DKIM/DMARC); spam / virus: this box's own mail
+#                             server files spam away and drops mail with a virus.
+#                             All on by default.
 #   allow <agent> <address|@domain>...   [--remove]   the owner's list: mail both ways without asking
 #   cap <agent> <n>           mails a day (default 50)
 #   server setup --domain=<d> [--relay=resend | --relay-host=<h> --relay-port=587 --relay-login=<u>] [--task=<DIVE-N>]
@@ -189,7 +194,7 @@ email_connect() {
   fi
 
   step "Writing $agent's email settings ($address)"
-  local keep; keep=$(jq -c '{approve_new, approve_inbound, allowed, daily_cap, free_domains} | with_entries(select(.value != null))' "$(_cfg "$agent")" 2>/dev/null || echo '{}')
+  local keep; keep=$(jq -c '{approve_new, approve_inbound, allowed, daily_cap, free_domains, check_sender} | with_entries(select(.value != null))' "$(_cfg "$agent")" 2>/dev/null || echo '{}')
   _install_cfg "$agent" "$(jq -n --arg a "$address" --arg n "$name" --arg ih "$ih" --argjson ip "$ip" --argjson is "$is" \
       --arg sh "$sh" --argjson sp "$sp" --argjson ss "$ss" --arg u "$login" --arg pw "$secret" --argjson keep "$keep" '
     {address:$a, name:$n, mode:"imap",
@@ -224,7 +229,7 @@ _connect_self() {  # <agent> <name> <info>
   jq --arg a "$agent" --arg m "$box" --argjson u "$uid" --argjson g "$gid" --arg h "$hash" \
     '.agents[$a] = {maildir:$m, uid:$u, gid:$g, pass_sha256:$h}' "$conf" >"$tmp" && install -m 600 "$tmp" "$conf"
   rm -f "$tmp"
-  local keep; keep=$(jq -c '{approve_new, approve_inbound, allowed, daily_cap, free_domains} | with_entries(select(.value != null))' "$(_cfg "$agent")" 2>/dev/null || echo '{}')
+  local keep; keep=$(jq -c '{approve_new, approve_inbound, allowed, daily_cap, free_domains, check_sender} | with_entries(select(.value != null))' "$(_cfg "$agent")" 2>/dev/null || echo '{}')
   _install_cfg "$agent" "$(jq -n --arg a "$address" --arg n "$name" --arg m "$box" --arg pw "$pass" --argjson keep "$keep" '
     {address:$a, name:$n, mode:"local", maildir:$m,
      smtp:{host:"127.0.0.1", port:587, secure:false, user:$a, pass:$pw}} + $keep')"
@@ -245,16 +250,23 @@ email_status() {
   local agent="${1:-}"
   [[ -n "$agent" ]] || fail "$E_USAGE" "usage: 5dive email status <agent>"
   _name_ok "$agent" || fail "$E_VALIDATION" "not an agent name: $agent"
-  local dir cfg connected=false address="" mode="" gate=on door=on cap=50 chans last="" held=0 held_in=0 sent=0 allowed='[]'
+  local dir cfg connected=false address="" mode="" gate=on door=on sender=on spam=on virus=on cap=50 chans last="" held=0 held_in=0 sent=0 allowed='[]'
   dir=$(_state_dir "$agent"); cfg="$dir/config.json"
   if [[ -r "$cfg" ]] && jq -e '.address and .mode and .smtp' "$cfg" >/dev/null 2>&1; then
     connected=true
     address=$(jq -r .address "$cfg"); mode=$(jq -r .mode "$cfg")
     [[ "$(jq -r '.approve_new' "$cfg")" == false ]] && gate=off
     [[ "$(jq -r '.approve_inbound' "$cfg")" == false ]] && door=off
+    [[ "$(jq -r '.check_sender' "$cfg")" == false ]] && sender=off
     cap=$(jq -r '.daily_cap // 50' "$cfg")
     # DIVE-8404: the owner's list, so the app's settings screen can show it.
     allowed=$(jq -c '[(.allowed // [])[] | strings]' "$cfg" 2>/dev/null || echo '[]')
+    if [[ "$mode" == local ]]; then
+      [[ -r "$MAIL_ETC/server.json" ]] && [[ "$(jq -r --arg a "$agent" '.agents[$a].spam' "$MAIL_ETC/server.json" 2>/dev/null)" == false ]] && spam=off
+      [[ -r "$MAIL_ETC/server.json" ]] && [[ "$(jq -r --arg a "$agent" '.agents[$a].virus' "$MAIL_ETC/server.json" 2>/dev/null)" == false ]] && virus=off
+    else
+      spam=provider; virus=provider
+    fi
   fi
   chans=$(_agent_json "$agent" | jq -r '.channels // "none"' 2>/dev/null || echo "?")
   [[ -r "$dir/messages.log" ]] && last=$(tail -1 "$dir/messages.log" | cut -f1,2)
@@ -266,7 +278,8 @@ email_status() {
   if [[ "${FIVEDIVE_JSON_MODE:-0}" == 1 ]]; then
     jq -n --arg a "$agent" --argjson c "$connected" --arg ad "$address" --arg m "$mode" --arg g "$gate" --arg d "$door" --arg cap "$cap" \
       --arg ch "$chans" --arg last "$last" --argjson h "$held" --argjson hi "$held_in" --argjson s "$sent" --argjson al "$allowed" \
-      '{ok:true, data:{agent:$a, connected:$c, address:$ad, mode:$m, gate:$g, inbound_gate:$d, daily_cap:($cap|tonumber? // 50), sent_today:$s, held:$h, held_inbound:$hi, channels:$ch, last_message:$last, allowed:$al}}'
+      --arg sc "$sender" --arg sp "$spam" --arg vi "$virus" \
+      '{ok:true, data:{agent:$a, connected:$c, address:$ad, mode:$m, gate:$g, inbound_gate:$d, sender_check:$sc, spam_filter:$sp, virus_scan:$vi, daily_cap:($cap|tonumber? // 50), sent_today:$s, held:$h, held_inbound:$hi, channels:$ch, last_message:$last, allowed:$al}}'
     return 0
   fi
   echo "agent:      $agent"
@@ -276,6 +289,12 @@ email_status() {
   echo "channel on: $([[ ",$chans," == *",email,"* ]] && echo yes || echo "no (channels=$chans)")"
   echo "writing to: $([[ "$gate" == on ]] && echo "a first mail to a new outside address waits for your tap" || echo "mails anyone (gate off)")"
   echo "mail from:  $([[ "$door" == on ]] && echo "a first mail from someone unknown waits for your tap, unseen by $agent" || echo "anyone reaches $agent (inbound gate off)")"
+  echo "sender:     $([[ "$sender" == on ]] && echo "checked: a faked From (no SPF/DKIM/DMARC proof) waits for your tap like a stranger's" || echo "not checked: the From line is believed (sender check off)")"
+  case "$spam" in
+    provider) echo "spam/virus: filtered by the mailbox's own provider before $agent reads it" ;;
+    *) echo "spam:       $([[ "$spam" == on ]] && echo "filed in the spam folder, never shown to $agent" || echo "not filtered (spam filter off)")"
+       echo "viruses:    $([[ "$virus" == on ]] && echo "a mail with a virus is dropped; you hear about it once a day" || echo "not scanned (virus scan off)")" ;;
+  esac
   echo "today:      $sent of $cap mails sent"
   echo "no asking:  $(jq -r 'if length == 0 then "nobody yet (sudo 5dive email allow '"$agent"' <address|@domain>)" else join(", ") end' <<<"$allowed")"
   (( held > 0 )) && echo "waiting:    $held outgoing mail(s) wait for your answer (5dive people ls)"
@@ -317,16 +336,34 @@ _cfg_set() {  # <agent> <jq filter> [jq args...] — rewrite the agent's config,
 email_gate() {
   local agent="${1:-}" which=send v
   [[ $# -gt 0 ]] && shift
-  [[ "${1:-}" =~ ^(send|inbound)$ ]] && { which="$1"; shift; }
+  [[ "${1:-}" =~ ^(send|inbound|sender|spam|virus)$ ]] && { which="$1"; shift; }
   v="${1:-}"
-  [[ -n "$agent" && "$v" =~ ^(on|off)$ ]] || fail "$E_USAGE" "usage: sudo 5dive email gate <agent> [send|inbound] on|off"
+  [[ -n "$agent" && "$v" =~ ^(on|off)$ ]] || fail "$E_USAGE" "usage: sudo 5dive email gate <agent> [send|inbound|sender|spam|virus] on|off"
   [[ $EUID -eq 0 ]] || fail "$E_PERMISSION" "run it as root: sudo 5dive email gate $agent $which $v"
   _name_ok "$agent" || fail "$E_VALIDATION" "not an agent name: $agent"
-  local key=approve_new; [[ "$which" == inbound ]] && key=approve_inbound
-  _cfg_set "$agent" '.[$k] = $on' --arg k "$key" --argjson on "$([[ "$v" == on ]] && echo true || echo false)"
-  "$FIVEDIVE_BIN" agent restart "$agent" >/dev/null 2>&1 || warn "restart $agent to apply it"
+  local on; on=$([[ "$v" == on ]] && echo true || echo false)
+  if [[ "$which" == spam || "$which" == virus ]]; then
+    # The box's own mail server filters at receipt (mailserver.ts reads it per mail: no restart).
+    [[ -w "$MAIL_ETC/server.json" ]] && jq -e --arg a "$agent" '.agents[$a]' "$MAIL_ETC/server.json" >/dev/null 2>&1 \
+      || fail "$E_VALIDATION" "$agent is not on this box's own mail server: the firm's mailbox provider filters $which itself"
+    local tmp; tmp=$(mktemp)
+    jq --arg a "$agent" --arg k "$which" --argjson on "$on" '.agents[$a][$k] = $on' "$MAIL_ETC/server.json" >"$tmp" && [[ -s "$tmp" ]] \
+      || { rm -f "$tmp"; fail "$E_VALIDATION" "could not change $MAIL_ETC/server.json"; }
+    install -m 600 "$tmp" "$MAIL_ETC/server.json"; rm -f "$tmp"
+  else
+    local key=approve_new
+    case "$which" in inbound) key=approve_inbound ;; sender) key=check_sender ;; esac
+    _cfg_set "$agent" '.[$k] = $on' --arg k "$key" --argjson on "$on"
+    "$FIVEDIVE_BIN" agent restart "$agent" >/dev/null 2>&1 || warn "restart $agent to apply it"
+  fi
   email_audit gate "$agent" "$which" "$v"
   case "$which $v" in
+    "sender on")   echo "$agent believes a From line only when the sender is confirmed; a faked one waits for your tap." ;;
+    "sender off")  echo "$agent now believes the From line as written: a faked colleague would get straight through." ;;
+    "spam on")     echo "Spam to $agent goes to its spam folder and never reaches it." ;;
+    "spam off")    echo "Spam is no longer filtered for $agent (the door and the sender check still hold)." ;;
+    "virus on")    echo "Mail with a virus to $agent is dropped; you hear about it once a day." ;;
+    "virus off")   echo "Attachments to $agent are no longer scanned for viruses." ;;
     "send on")     echo "$agent asks you before a first mail to a new outside address." ;;
     "send off")    echo "$agent now mails anyone without asking (the daily limit still holds)." ;;
     "inbound on")  echo "A first mail from someone unknown now waits for your Allow before $agent sees it." ;;
@@ -520,6 +557,7 @@ _server_setup() {
   install -d -m 700 "$MAIL_ETC"
   install -d -m 711 "$MAIL_SPOOL"
   install -d -m 700 "$MAIL_SPOOL/queue"
+  _install_filters
   local key="$MAIL_ETC/dkim.key" sel="oa1"
   if [[ ! -s "$key" ]]; then
     step "Making the DKIM signing key"
@@ -568,6 +606,49 @@ EOF
   echo "Then give an agent its address: sudo 5dive email connect <agent> --self-hosted"
 }
 
+# DIVE-8405: the spam filter (rspamd) and the virus scanner (ClamAV) run ON this
+# box: no mail is sent to a cloud scanner. Their signatures update by themselves
+# while the box is online (rspamd's maps, freshclam) and keep working offline.
+# Never fatal: without them the server still runs, catches only the GTUBE test
+# string, and marks attachments to the agent as unscanned. EMAIL_NO_FILTERS=1
+# skips the install (the CLI harness; a box that must stay lean).
+_mem_mb() { awk '/^MemTotal:/{print int($2/1024)}' /proc/meminfo 2>/dev/null || echo 0; }
+_install_filters() {
+  [[ "${EMAIL_NO_FILTERS:-0}" == 1 ]] && return 0
+  local want=()
+  command -v rspamd >/dev/null 2>&1 || want+=(rspamd)
+  if ! command -v clamd >/dev/null 2>&1; then
+    # clamd holds its signatures in memory (about 1.5 GB): a small box skips it.
+    if (( $(_mem_mb) >= 3500 )); then want+=(clamav-daemon clamav-freshclam)
+    else warn "this server has under 4 GB of memory: no virus scanner (attachments reach agents marked unscanned)"; fi
+  fi
+  if (( ${#want[@]} )); then
+    if _offline; then
+      warn "offline: the spam filter and virus scanner are not installed (${want[*]}); install them while online"
+    elif command -v apt-get >/dev/null 2>&1; then
+      step "Installing the spam filter and virus scanner (${want[*]}), both run on this server"
+      DEBIAN_FRONTEND=noninteractive apt-get install -y -q "${want[@]}" >&2 \
+        || warn "could not install ${want[*]}: mail still works, filtered less (sudo apt-get install ${want[*]})"
+    else
+      warn "no apt-get here: install rspamd and clamav-daemon by hand for spam and virus filtering"
+    fi
+  fi
+  if command -v rspamd >/dev/null 2>&1; then "$SYSTEMCTL" enable --now rspamd >/dev/null 2>&1 || warn "rspamd did not start: journalctl -u rspamd"; fi
+  if command -v clamd >/dev/null 2>&1; then
+    "$SYSTEMCTL" enable --now clamav-freshclam >/dev/null 2>&1 || true
+    "$SYSTEMCTL" enable --now clamav-daemon >/dev/null 2>&1 || warn "the virus scanner starts once its signatures are downloaded (clamav-freshclam)"
+  fi
+  return 0
+}
+
+_filters_line() {
+  local sp="off (only the GTUBE test string is caught): sudo 5dive email server setup installs rspamd" vi="off (attachments reach agents marked unscanned)"
+  "$SYSTEMCTL" is-active rspamd >/dev/null 2>&1 && sp="on (rspamd, on this server)"
+  "$SYSTEMCTL" is-active clamav-daemon >/dev/null 2>&1 && vi="on (ClamAV, on this server)"
+  echo "spam:       $sp"
+  echo "viruses:    $vi"
+}
+
 _server_dns() {  # <domain> <key> <selector> <relay host>
   local domain="$1" key="$2" sel="$3" rh="$4" ip pub
   ip=$(curl -fsS -m 4 https://api.ipify.org 2>/dev/null || hostname -I | awk '{print $1}')
@@ -596,6 +677,7 @@ _server_status() {
   echo "server:     ${active:-inactive}"
   echo "agents:     $n ($(jq -r '.agents | keys | map(. + "@'"$domain"'") | join(", ")' "$conf"))"
   echo "relay:      $(jq -r '.relay.host // "none (straight to the recipient)"' "$conf")"
+  _filters_line
   if ! jq -e '.relay.host' "$conf" >/dev/null 2>&1 && ! _offline; then
     local prc=0; _send_probe || prc=$?
     case "$prc" in
@@ -632,9 +714,11 @@ _email_main() {
                                  <agent>@<domain> on this box's own mail server
   5dive email status <agent>
   sudo 5dive email disconnect <agent>
-  sudo 5dive email gate <agent> [send|inbound] on|off
+  sudo 5dive email gate <agent> [send|inbound|sender|spam|virus] on|off
                                  send: ask before a first mail TO someone new
                                  inbound: hold a first mail FROM someone new until you Allow it
+                                 sender: hold a mail whose sender cannot be confirmed (a faked From)
+                                 spam / virus: this server's own mail filters (on by default)
   sudo 5dive email allow <agent> <address|@domain>... [--remove]
                                  mail both ways without asking
   sudo 5dive email cap <agent> <n>       mails a day (default 50)

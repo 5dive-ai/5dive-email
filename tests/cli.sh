@@ -41,6 +41,8 @@ export EMAIL_MAIL_ETC="$W/etc" EMAIL_MAIL_SPOOL="$W/spool" FIVE_LOCAL_ONLY_FILE=
 # meets a closed local port. Arms that need it open point it at tests/greeter.py.
 # An install that gets past the check stops at once: MAIL_OPT sits under a file.
 : >"$W/blocker"
+# EMAIL_NO_FILTERS: setup must not apt-get rspamd/ClamAV onto the runner (DIVE-8405).
+export EMAIL_NO_FILTERS=1
 export EMAIL_SEND_PROBE_HOSTS="127.0.0.1:1" EMAIL_SEND_PROBE_TIMEOUT=1 EMAIL_MAIL_OPT="$W/blocker/opt"
 CFG="$W/home/agent-max/.claude/channels/email/config.json"
 run() { : >"$STUB_LOG"; OUT=$(bash "$BIN" "$@" 2>&1); RC=$?; }
@@ -90,6 +92,10 @@ run connect max --provider=google
 run allow max @example.org --remove
 [[ $RC == 0 && "$(jq -c '.allowed' "$CFG")" == "[\"$B\"]" ]] && ok "G7 allow --remove takes one off" || bad "G7 remove" "$RC $OUT $(cat "$CFG")"
 run gate max inbound on
+run gate max sender off
+[[ $RC == 0 && "$(jq -r .check_sender "$CFG")" == false && "$OUT" == *"faked colleague"* ]] && ok "G8 gate sender off writes check_sender:false and says what it opens" || bad "G8 sender off" "$RC $OUT"
+run gate max spam off
+[[ $RC == 3 && "$OUT" == *"provider filters spam itself"* ]] && ok "G9 spam gate on a firm mailbox is refused: the provider filters" || bad "G9 spam on imap" "$RC $OUT"
 
 echo "the Resend preset (optional; direct sending stays the default)"
 run server setup --domain=example.com --relay=resend
@@ -163,6 +169,17 @@ PW=$(jq -r .smtp.pass "$CFG"); H=$(printf '%s' "$PW" | sha256sum | cut -d' ' -f1
    && "$(jq -r .agents.max.maildir "$W/etc/server.json")" == "$W/spool/boxes/max" && -d "$W/spool/boxes/max/new" ]] \
   && ok "S2 self-hosted: max@<domain>, a fresh password whose hash is on the server, its own maildir" || bad "S2 self-hosted" "$RC $OUT $(cat "$CFG")"
 [[ "$OUT" != *"$PW"* ]] && ok "S2b the new password is never printed" || bad "S2b printed"
+[[ "$(jq -r .check_sender "$CFG")" == false ]] && ok "S2c connect keeps the sender-check switch" || bad "S2c keep check_sender" "$(cat "$CFG")"
+run gate max sender on
+run gate max spam off
+[[ $RC == 0 && "$(jq -c '.agents.max | [.spam, .virus]' "$W/etc/server.json")" == '[false,null]' ]] && ok "G10 gate spam off: the server skips spam filtering for max only" || bad "G10 spam off" "$RC $OUT $(cat "$W/etc/server.json")"
+run gate max virus off
+OUT=$(FIVEDIVE_JSON_MODE=1 bash "$BIN" status max 2>&1)
+[[ "$(jq -c '.data | [.sender_check,.spam_filter,.virus_scan]' <<<"$OUT")" == '["on","off","off"]' ]] && ok "G11 status --json carries the sender check and both filters" || bad "G11 status filters" "$OUT"
+run gate max spam on; run gate max virus on
+[[ "$(jq -c '.agents.max | [.spam, .virus]' "$W/etc/server.json")" == '[true,true]' ]] && ok "G12 gate spam/virus on again" || bad "G12 on" "$(cat "$W/etc/server.json")"
+OUT=$(bash "$BIN" status max 2>&1)
+[[ "$OUT" == *"sender:     checked"* && "$OUT" == *"viruses:    a mail with a virus is dropped"* ]] && ok "G13 status says what is checked, in plain words" || bad "G13 status words" "$OUT"
 
 EMAIL_SEND_PROBE_HOSTS=$SHUT run server status
 [[ "$OUT" == *"sending:    BLOCKED"*"--relay=resend"* ]] && ok "P9 server status shows sending BLOCKED and the fix" || bad "P9 status shut" "$RC $OUT"

@@ -25,10 +25,16 @@ jobs:
       - name: manifests are valid JSON
         run: jq -e . email/.claude-plugin/plugin.json .claude-plugin/marketplace.json email/hooks/hooks.json email/.mcp.json >/dev/null
       - name: the channel the manifest declares to 5dive
-        run: jq -e '.fivedive.channel | .name == "email" and (.knock.cards | has("send") and has("receive")) and (.local_only.label | type == "string")' email/.claude-plugin/plugin.json
+        run: jq -e '.fivedive.channel | .name == "email" and (.knock.cards | has("send") and has("receive") and has("receive_unconfirmed")) and (.local_only.label | type == "string")' email/.claude-plugin/plugin.json
       - name: unit
         run: bun test tests/email.test.ts
       - name: cli
         run: sudo bash tests/cli.sh
-      - name: end to end
+      - name: end to end (stand-in virus scanner, no spam filter)
         run: cd email && bun install --frozen-lockfile && bun e2e.ts
+      # DIVE-8405: the same run against the box's real filters — rspamd, and
+      # ClamAV's clamd with a test-only EICAR signature (no signature download).
+      - name: the real filters (rspamd, ClamAV)
+        run: bash tests/filters-ci.sh >>"$GITHUB_ENV"
+      - name: end to end (real rspamd and clamd)
+        run: cd email && bun e2e.ts
