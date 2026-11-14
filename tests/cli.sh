@@ -172,9 +172,16 @@ EMAIL_SEND_PROBE_HOSTS=$OPEN run server status
 echo "status, disconnect"
 OUT=$(FIVEDIVE_JSON_MODE=1 bash "$BIN" status max 2>&1)
 [[ "$(jq -c '.data | [.connected,.address,.mode,.gate,.inbound_gate,.held_inbound]' <<<"$OUT")" == "[true,\"$A\",\"local\",\"on\",\"on\",0]" ]] && ok "T1 status --json" || bad "T1 status" "$OUT"
+[[ "$(jq -c '.data.allowed' <<<"$OUT")" == "$(jq -c '.allowed // []' "$CFG")" && "$(jq -r '.data.allowed | type' <<<"$OUT")" == array ]] \
+  && ok "T1b status --json carries the owner's list (the app's settings screen shows it, DIVE-8404)" || bad "T1b allowed" "$OUT $(cat "$CFG")"
 run disconnect max
 [[ $RC == 0 && ! -e "$CFG" && ! -e "$W/conn/email-max.env" && "$(jq -c '.agents' "$W/etc/server.json")" == '{}' && "$(cat "$W/channels")" == telegram ]] \
   && ok "T2 disconnect: config, password and server entry gone; channel off" || bad "T2 disconnect" "$RC $OUT"
+# DIVE-8404: an agent whose ONLY channel is email (grep -v finds nothing to keep).
+echo email >"$W/channels"; mkdir -p "$(dirname "$CFG")"; echo '{"address":"x@example.com","mode":"imap","smtp":{}}' >"$CFG"
+run disconnect max
+[[ $RC == 0 && ! -e "$CFG" && "$(cat "$W/channels")" == none ]] \
+  && ok "T3 disconnect works when email is the agent's only channel (channels=none)" || bad "T3 email-only disconnect" "$RC $OUT"
 
 echo "$PASS passed, $FAIL failed"
 (( FAIL == 0 ))
