@@ -5,6 +5,9 @@
 //   mode "imap"   the firm's Google Workspace, on-site Exchange or any
 //                 IMAP+SMTP server. Mail is read over IMAP (IDLE, with a poll
 //                 behind it) and sent through the firm's SMTP.
+//                 A Microsoft 365 / Outlook mailbox is the same mode with a
+//                 Microsoft sign-in (cfg.oauth, msauth.ts) instead of a password:
+//                 IMAP and SMTP authenticate with a token (XOAUTH2) (DIVE-8407).
 //   mode "local"  the box's own mail server (OpenAgent Mail, mailserver.ts) for
 //                 a domain the firm points at the box. Mail lands in the agent's
 //                 maildir; it goes out through the server's 127.0.0.1 submission
@@ -42,6 +45,7 @@ import { ImapFlow } from 'imapflow'
 import { simpleParser } from 'mailparser'
 import nodemailer from 'nodemailer'
 import { installLifecycle, recordLifecycle } from './lifecycle.ts'
+import { tokenSource, SignInError } from './msauth.ts'
 import {
   parseConfig, readState, trimState, remember, normAddr, threadRoot, chatIdOf, replySubject, nextReferences,
   renderInbound, gateFor, inboundGate, capLeft, countSent, afterAnswer, mayReach, SHUT_LINE, knockFileArgs, knockFiled,
@@ -173,18 +177,62 @@ function deliver(content: string, meta: Record<string, string>): Promise<void> {
 
 // ── sending ──────────────────────────────────────────────────────────────────
 let transport: ReturnType<typeof nodemailer.createTransport> | null = null
-function smtp() {
+let transportToken = ''
+async function smtp() {
+  const s = cfg!.smtp
+  const token = ms ? (await msToken()).token : ''
+  if (transport && token !== transportToken) { transport.close(); transport = null }
   if (!transport) {
-    const s = cfg!.smtp
+    transportToken = token
     transport = nodemailer.createTransport({
       host: s.host, port: s.port, secure: s.secure, requireTLS: !s.secure && s.host !== '127.0.0.1',
-      auth: { user: s.user, pass: s.pass },
+      // A Microsoft mailbox: AUTH XOAUTH2 with the token, never a password.
+      auth: ms ? { type: 'OAuth2', user: s.user, accessToken: token } : { user: s.user, pass: s.pass },
       // The box's own server signs with its own certificate on 127.0.0.1.
       ignoreTLS: s.host === '127.0.0.1',
       connectionTimeout: 20_000, greetingTimeout: 20_000, socketTimeout: 60_000,
     })
   }
   return transport
+}
+
+// ── Microsoft sign-in (DIVE-8407) ────────────────────────────────────────────
+// The refresh token is in config.json; a new one from Microsoft replaces it
+// there at once (the old one stops working). The file stays the agent's, 0600.
+const ms = cfg?.oauth ? tokenSource(cfg.oauth, keepRefreshToken) : null
+function keepRefreshToken(rt: string) {
+  try {
+    const raw = JSON.parse(readFileSync(CONFIG_PATH, 'utf8'))
+    if (!raw.oauth) return
+    raw.oauth.refresh_token = rt
+    writeFileSync(`${CONFIG_PATH}.tmp`, JSON.stringify(raw, null, 2) + '\n', { mode: 0o600 })
+    renameSync(`${CONFIG_PATH}.tmp`, CONFIG_PATH)
+  } catch (e) {
+    say(`could not keep Microsoft's new sign-in: ${e}`)
+  }
+}
+async function msToken() {
+  await assertReachable(new URL(process.env.EMAIL_MS_AUTHORITY || 'https://login.microsoftonline.com').hostname)
+  try {
+    const t = await ms!.get()
+    if (state.signin_told_at) { state.signin_told_at = undefined; saveState() }
+    return t
+  } catch (e) {
+    if (e instanceof SignInError && e.again) void signInAgain(e.message)
+    throw e
+  }
+}
+// The sign-in is dead (revoked, the password changed, consent pulled): only a
+// person can fix it. Tell the owner once a day, in words, with the one command.
+async function signInAgain(why: string) {
+  recordLifecycle(STATE_DIR, 'start', 'email', `microsoft sign-in: ${why} (sudo 5dive email connect ${AGENT} --provider=microsoft)`)
+  const last = Date.parse(state.signin_told_at ?? '')
+  if (Date.now() - (Number.isFinite(last) ? last : 0) < 24 * 3600_000) return
+  state.signin_told_at = new Date().toISOString()
+  saveState()
+  const line = `${cfg!.name || AGENT} can no longer read or send ${cfg!.address}: ${why}. Someone signs in to that mailbox again: sudo 5dive email connect ${AGENT} --provider=microsoft`
+  const p = Bun.spawn([FIVEDIVE, 'agent', 'send', 'owner', `--message=${line}`], { stdin: 'ignore', stdout: 'ignore', stderr: 'pipe' })
+  if ((await p.exited) !== 0) say(`could not tell the owner the sign-in needs doing again: ${(await new Response(p.stderr).text()).trim().split('\n').pop()}`)
 }
 
 function checkFiles(files: string[]): string[] {
@@ -208,7 +256,7 @@ async function sendNow(o: Out): Promise<string> {
   const t = o.chat ? state.threads[o.chat] : undefined
   const mid = `<${randomUUID()}@${cfg!.address.split('@')[1]}>`
   const refs = t ? nextReferences(t.refs, t.last) : []
-  await smtp().sendMail({
+  await (await smtp()).sendMail({
     from: { name: cfg!.name || AGENT, address: cfg!.address },
     to: o.to, cc: o.cc.length ? o.cc : undefined,
     subject: o.subject, text: o.text, messageId: mid,
@@ -543,6 +591,7 @@ async function releaseDoor() {
 // mode "imap": the firm's mailbox.
 let imapBusy = false
 let imapAgain = false
+let reconnecting = false
 async function imapLoop() {
   const c = cfg!.imap!
   let backoff = 5_000
@@ -550,8 +599,15 @@ async function imapLoop() {
     let client: ImapFlow | null = null
     try {
       await assertReachable(c.host)
-      client = new ImapFlow({ host: c.host, port: c.port, secure: c.secure, auth: { user: c.user, pass: c.pass }, logger: false, emitLogs: false })
-      await client.connect()
+      const tok = ms ? await msToken() : null
+      client = new ImapFlow({ host: c.host, port: c.port, secure: c.secure, auth: tok ? { user: c.user, accessToken: tok.token } : { user: c.user, pass: c.pass! }, logger: false, emitLogs: false })
+      try {
+        await client.connect()
+      } catch (e) {
+        // Refused with a token we thought good: get a fresh one next time.
+        if (ms && (e as any)?.authenticationFailed) ms.drop()
+        throw e
+      }
       const box = await client.mailboxOpen('INBOX')
       const uv = String(box.uidValidity)
       if (state.uid_validity !== uv || !Number.isInteger(state.last_uid)) {
@@ -595,14 +651,21 @@ async function imapLoop() {
       const every = Math.max(30, Number(cfg!.poll_seconds) || 60) * 1000
       await new Promise<void>(resolve => {
         const t = setInterval(() => void pull().catch(() => {}), every)
-        client!.on('close', () => { clearInterval(t); resolve() })
-        client!.on('error', () => { clearInterval(t); resolve() })
+        // Exchange ends a session when its token runs out: leave first, on our
+        // own terms, and come back with a new token (no mail is missed: last_uid).
+        const r = tok ? setTimeout(() => { reconnecting = true; void client!.logout().catch(() => {}) }, Math.max(60_000, tok.until - Date.now() - 300_000)) : null
+        const end = () => { clearInterval(t); if (r) clearTimeout(r); resolve() }
+        client!.on('close', end)
+        client!.on('error', end)
       })
     } catch (e) {
       say(`imap: ${e}`)
       recordLifecycle(STATE_DIR, 'start', 'email', `imap: ${String(e).slice(0, 200)} (retrying)`)
+      // A dead Microsoft sign-in is not fixed by retrying every few minutes.
+      if (e instanceof SignInError && e.again) backoff = 30 * 60_000
     }
     try { await client?.logout() } catch {}
+    if (reconnecting) { reconnecting = false; continue }
     await new Promise(r => setTimeout(r, backoff))
     backoff = Math.min(backoff * 2, 5 * 60_000)
   }

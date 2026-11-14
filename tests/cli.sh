@@ -53,7 +53,7 @@ run connect max --address=$A --provider=google --password=hunter2
 run connect max --address=not-an-address --provider=google
 [[ $RC == 3 ]] && ok "C2 a bad address is refused" || bad "C2 bad address" "$RC $OUT"
 run connect max --address=$A --provider=microsoft
-[[ $RC == 3 && "$OUT" == *"Microsoft sign-in"* && ! -e "$CFG" ]] && ok "C2b Microsoft 365 is refused honestly (no password IMAP there since 2022), nothing written" || bad "C2b microsoft" "$RC $OUT"
+[[ $RC == 2 && "$OUT" == *"your firm's own Microsoft app"* && "$OUT" == *"IT-GUIDE"* && ! -e "$CFG" ]] && ok "C2b Microsoft 365 without the firm's app id: says IT creates the app, nothing written" || bad "C2b microsoft" "$RC $OUT"
 run connect max --address=$A --provider=google
 [[ $RC == 6 && "$OUT" == *"secret write EMAIL_PASSWORD --connector=email-max"* && ! -e "$CFG" ]] && ok "C3 no password on the box yet: refused with the secret-write line" || bad "C3 no secret" "$RC $OUT"
 run connect max --address=$A --provider=google --task=DIVE-1
@@ -199,6 +199,66 @@ echo email >"$W/channels"; mkdir -p "$(dirname "$CFG")"; echo '{"address":"x@exa
 run disconnect max
 [[ $RC == 0 && ! -e "$CFG" && "$(cat "$W/channels")" == none ]] \
   && ok "T3 disconnect works when email is the agent's only channel (channels=none)" || bad "T3 email-only disconnect" "$RC $OUT"
+
+echo "connect, a Microsoft 365 mailbox (DIVE-8407), against a stand-in Microsoft sign-in"
+BUN="${EMAIL_BUN:-$(command -v bun || true)}"
+if [[ -z "$BUN" ]]; then
+  bad "MS bun" "bun is not on PATH (run: sudo env PATH=\"\$PATH\" bash tests/cli.sh)"
+else
+  export EMAIL_BUN="$BUN"
+  coproc MSSTUB { exec "$BUN" "$ROOT/tests/msstub.ts" 0; }
+  GPIDS+=("$MSSTUB_PID")
+  read -r -t 20 MSURL <&"${MSSTUB[0]}"
+  export EMAIL_MS_AUTHORITY="$MSURL"
+  ctl() { curl -fsS -X POST "$MSURL/_ctl" -d "$1" >/dev/null; }
+  APP=1b2c3d4e-0000-4000-8000-123456789abc
+  PEND="$W/conn/email-max.ms-pending.json"
+  rm -f "$CFG"; echo telegram >"$W/channels"; printf 'EMAIL_PASSWORD=old-pw\n' >"$W/conn/email-max.env"
+  run connect max --address=$A --provider=microsoft --client-id=not-an-id
+  [[ $RC == 3 && ! -e "$CFG" && ! -e "$PEND" ]] && ok "MS1 a client id that is not an app id is refused before Microsoft is asked" || bad "MS1 bad client id" "$RC $OUT"
+  ctl '{"who":"max@example.com","pending":99}'
+  run connect max --address=$A --provider=microsoft --client-id=$APP
+  [[ $RC == 6 && "$OUT" == *"https://microsoft.com/devicelogin"* && "$OUT" == *"K7QZ-4MPL"* && "$OUT" == *"signs in as $A"* && "$OUT" == *"run the same connect again"* \
+     && ! -e "$CFG" && "$(stat -c '%a %U' "$PEND")" == "600 root" \
+     && "$(curl -fsS "$MSURL/_log" | jq -r '.[-1] | [.path,.tenant,.fields.client_id,(.fields.scope|contains("IMAP.AccessAsUser.All") and contains("SMTP.Send") and contains("offline_access"))] | @tsv')" == "devicecode	example.com	$APP	true" ]] \
+    && ok "MS2 first run: Microsoft's link and code for whoever signs in as the mailbox; the firm's tenant (from the address) and app; the waiting sign-in kept root-only; nothing written" \
+    || bad "MS2 start" "$RC $OUT $(curl -fsS "$MSURL/_log")"
+  EMAIL_MS_WAIT=1 run connect max --address=$A --provider=microsoft --client-id=$APP
+  [[ $RC == 6 && "$OUT" == *"Not signed in yet"* && "$OUT" == *"K7QZ-4MPL"* && -e "$PEND" && ! -e "$CFG" \
+     && "$(curl -fsS "$MSURL/_log" | jq '[.[] | select(.path == "devicecode")] | length')" == 1 ]] \
+    && ok "MS3 run again before the sign-in: still waiting, the SAME code (no new one), nothing written" || bad "MS3 pending" "$RC $OUT"
+  ctl '{"who":"ann@example.com","pending":0}'
+  run connect max --address=$A --provider=microsoft --client-id=$APP
+  [[ $RC == 3 && "$OUT" == *"signed in ann@example.com, not $A"* && ! -e "$CFG" && ! -e "$PEND" ]] \
+    && ok "MS4 someone else signed in: refused (the agent must read ITS mailbox), nothing written" || bad "MS4 wrong account" "$RC $OUT"
+  ctl '{"who":"max@example.com","pending":0}'
+  run connect max --address=$A --provider=microsoft --client-id=$APP
+  run connect max --address=$A --provider=microsoft --client-id=$APP --name=Max
+  RT=$(jq -r '.oauth.refresh_token // empty' "$CFG" 2>/dev/null)
+  [[ $RC == 0 && "$(stat -c '%a %U' "$CFG")" == "600 $ME" && "$RT" == rt-* && "$OUT" != *"$RT"* \
+     && "$(jq -c '[.address,.mode,.oauth.provider,.oauth.tenant,.oauth.client_id,.imap.host,.imap.port,.imap.secure,.smtp.host,.smtp.port,.smtp.secure,.imap.user]' "$CFG")" == "[\"$A\",\"imap\",\"microsoft\",\"example.com\",\"$APP\",\"outlook.office365.com\",993,true,\"smtp.office365.com\",587,false,\"$A\"]" \
+     && "$(jq -c '[.imap.pass, .smtp.pass]' "$CFG")" == "[null,null]" && ! -e "$W/conn/email-max.env" && ! -e "$PEND" \
+     && "$(cat "$W/channels")" == "telegram,email" ]] \
+    && ok "MS5 signed in as the mailbox: 0600 config with the Microsoft sign-in and Microsoft's servers, no password anywhere (an old one deleted), token never printed, channel on" \
+    || bad "MS5 connect" "$RC $OUT $(cat "$CFG" 2>/dev/null)"
+  OUT=$(FIVEDIVE_JSON_MODE=1 bash "$BIN" status max 2>&1)
+  [[ "$(jq -c '.data | [.connected,.signin,.spam_filter]' <<<"$OUT")" == '[true,"microsoft","provider"]' ]] && ok "MS6 status says the mailbox signs in through Microsoft" || bad "MS6 status" "$OUT"
+  ctl '{"pending":99}'
+  run connect max --provider=microsoft
+  [[ $RC == 6 && "$OUT" == *"K7QZ-4MPL"* && "$(jq -r '.oauth.refresh_token' "$CFG")" == "$RT" \
+     && "$(curl -fsS "$MSURL/_log" | jq -r '.[-1] | [.tenant,.fields.client_id] | @tsv')" == "example.com	$APP" ]] \
+    && ok "MS7 sign in again later with just --provider=microsoft: address and the firm's app come from the config, which stays working until the new sign-in lands" \
+    || bad "MS7 re-sign-in" "$RC $OUT"
+  run disconnect max
+  [[ $RC == 0 && ! -e "$CFG" && ! -e "$PEND" && "$OUT" == *"Microsoft sign-in is deleted"* ]] && ok "MS8 disconnect deletes the sign-in and any waiting one" || bad "MS8 disconnect" "$RC $OUT"
+  ctl '{"pending":0,"error":"authorization_declined"}'
+  run connect max --address=$A --provider=microsoft --client-id=$APP
+  run connect max --address=$A --provider=microsoft --client-id=$APP
+  [[ $RC == 6 && "$OUT" == *"declined at Microsoft"* && ! -e "$CFG" && ! -e "$PEND" ]] && ok "MS9 the sign-in declined at Microsoft: said in words, nothing written, next run starts fresh" || bad "MS9 declined" "$RC $OUT"
+  ctl '{"error":null,"start_error":"invalid_request"}'
+  run connect max --address=$A --provider=microsoft --client-id=$APP --tenant=72f988bf-86f1-41af-91ab-2d7cd011db47
+  [[ $RC == 6 && "$OUT" == *"Allow public client flows"* && ! -e "$PEND" ]] && ok "MS10 the firm's app is not set for this sign-in: names the one switch their IT turns on" || bad "MS10 public client" "$RC $OUT"
+fi
 
 echo "$PASS passed, $FAIL failed"
 (( FAIL == 0 ))

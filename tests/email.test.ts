@@ -383,3 +383,82 @@ describe('spam, viruses and phishing (DIVE-8405)', () => {
     expect(knockFileArgs(OUT1, '', 'receive_unconfirmed')).toContain('--kind=receive_unconfirmed')
   })
 })
+
+// ── DIVE-8407: a Microsoft 365 / Outlook mailbox, signed in through the firm's own app ──
+import { signedInAs, tokenSource, deviceStart, devicePoll, oauthOk, SignInError } from '../email/msauth.ts'
+import { identity } from './msstub.ts'
+
+describe('microsoft sign-in', () => {
+  const CLIENT = '1b2c3d4e-0000-4000-8000-123456789abc'
+  const oauth = { provider: 'microsoft', tenant: 'example.com', client_id: CLIENT, refresh_token: 'rt-x' }
+  const msCfg = { address: SELF, mode: 'imap', oauth,
+    imap: { host: 'outlook.office365.com', port: 993, secure: true, user: SELF },
+    smtp: { host: 'smtp.office365.com', port: 587, secure: false, user: SELF } }
+
+  test('a Microsoft mailbox config parses with no password; the token stands in for it', () => {
+    expect(parseConfig(msCfg)?.oauth?.client_id).toBe(CLIENT)
+    // Without the sign-in, the same endpoints with no password are no config.
+    expect(parseConfig({ ...msCfg, oauth: undefined })).toBeNull()
+  })
+  test('a broken sign-in is no config: another provider, a bad app id, the shared "common" tenant, no refresh token, local mode', () => {
+    expect(parseConfig({ ...msCfg, oauth: { ...oauth, provider: 'google' } })).toBeNull()
+    expect(parseConfig({ ...msCfg, oauth: { ...oauth, client_id: 'not-a-guid' } })).toBeNull()
+    expect(parseConfig({ ...msCfg, oauth: { ...oauth, tenant: 'common' } })).toBeNull()
+    expect(parseConfig({ ...msCfg, oauth: { ...oauth, refresh_token: '' } })).toBeNull()
+    expect(parseConfig({ ...msCfg, mode: 'local', maildir: '/var/lib/x' })).toBeNull()
+    expect(oauthOk({ ...oauth, tenant: '72f988bf-86f1-41af-91ab-2d7cd011db47' })).toBe(true)
+  })
+  test('who signed in is read from the id_token; garbage reads as nobody', () => {
+    const tok = (c: object) => `e30.${Buffer.from(JSON.stringify(c)).toString('base64url')}.`
+    expect(signedInAs(tok({ preferred_username: 'Mike@Example.com' }))).toBe('mike@example.com')
+    expect(signedInAs(tok({ email: SELF }))).toBe(SELF)
+    expect(signedInAs('garbage')).toBe('')
+    expect(signedInAs(undefined)).toBe('')
+  })
+  test("Microsoft's own Authentication-Results (no server id in front) confirm or refuse the sender (DIVE-8405 on this route)", () => {
+    const pass = 'spf=pass (sender IP is 192.0.2.7) smtp.mailfrom=outside.test; dkim=pass (signature was verified) header.d=outside.test;dmarc=pass action=none header.from=outside.test;compauth=pass reason=100'
+    expect(senderCheck(pass, OUT1).ok).toBe(true)
+    const fake = 'spf=fail (sender IP is 192.0.2.9) smtp.mailfrom=example.com; dkim=none (message not signed) header.d=none;dmarc=fail action=quarantine header.from=example.com;compauth=fail reason=000'
+    expect(senderCheck(fake, COLLEAGUE)).toEqual({ ok: false, why: 'example.com says this server may not send its mail (dmarc=fail)' })
+  })
+
+  test('tokens: one refresh for many callers, a rotated refresh token is kept, a revoked one says sign in again', async () => {
+    const id = identity()
+    process.env.EMAIL_MS_AUTHORITY = id.url
+    try {
+      id.ctl.who = SELF; id.ctl.pending = 0
+      const p = await deviceStart('example.com', CLIENT, SELF)
+      const d = (await devicePoll(p, 5000, async () => {}))!
+      expect(d.who).toBe(SELF)
+      const kept: string[] = []
+      const o = { provider: 'microsoft' as const, tenant: 'example.com', client_id: CLIENT, refresh_token: d.refresh_token }
+      const src = tokenSource(o, rt => kept.push(rt))
+      const [a, b] = await Promise.all([src.get(), src.get()])
+      expect(a.token).toBe(b.token)
+      expect(id.log.filter(l => l.fields.grant_type === 'refresh_token').length).toBe(1)
+      expect(kept).toEqual([o.refresh_token])
+      expect(kept[0]).not.toBe(d.refresh_token)
+      expect((await src.get()).token).toBe(a.token) // still fresh: no new refresh
+      src.drop(); id.ctl.dead = true
+      const e = await src.get().catch(x => x)
+      expect(e).toBeInstanceOf(SignInError)
+      expect([e.code, e.again, e.message]).toEqual(['invalid_grant', true, 'Microsoft wants the mailbox signed in again'])
+    } finally {
+      id.stop()
+    }
+  })
+  test('the sign-in refusals a firm meets say what their IT fixes', async () => {
+    const id = identity()
+    process.env.EMAIL_MS_AUTHORITY = id.url
+    try {
+      id.ctl.start_error = 'invalid_request' // AADSTS7000218 in the description: not a public client
+      expect(String(await deviceStart('example.com', CLIENT, SELF).catch(x => x.message))).toContain('Allow public client flows')
+      id.ctl.start_error = undefined
+      id.ctl.error = 'authorization_declined'
+      const p = await deviceStart('example.com', CLIENT, SELF)
+      expect(String(await devicePoll(p, 5000, async () => {}).catch(x => x.message))).toBe('the sign-in was declined at Microsoft')
+    } finally {
+      id.stop()
+    }
+  })
+})
