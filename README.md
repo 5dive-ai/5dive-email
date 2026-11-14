@@ -8,6 +8,10 @@ sudo 5dive plugin add 5dive-ai/5dive-email
 sudo 5dive email connect mike --address=mike@yourfirm.com --provider=google --task=<DIVE-N>
 ```
 
+Microsoft 365 / Outlook: `--provider=microsoft --client-id=<your firm's app>`.
+It signs in with a Microsoft code, through an app your own IT creates in your
+own Microsoft account. No password, and no 5dive account in between.
+
 Or run the mail on your server: `sudo 5dive email server setup --domain=ai.yourfirm.com`,
 then `sudo 5dive email connect mike --self-hosted`.
 
