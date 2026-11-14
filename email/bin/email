@@ -129,7 +129,8 @@ _agent_check() {  # <agent> -> prints info json
   _name_ok "$agent" || fail "$E_VALIDATION" "not an agent name: $agent"
   info=$(_agent_json "$agent") || fail "$E_NOT_FOUND" "no agent named '$agent'"
   type=$(jq -r '.type // empty' <<<"$info")
-  [[ "$type" == claude ]] || fail "$E_VALIDATION" "email is for Claude Code agents for now ('$agent' is $type)"
+  # DIVE-8464: Codex too (the 5dive dispatcher runs this plugin as its email adapter).
+  [[ "$type" == claude || "$type" == codex ]] || fail "$E_VALIDATION" "email is for Claude Code and Codex agents for now ('$agent' is $type)"
   printf '%s' "$info"
 }
 

@@ -28,6 +28,11 @@ jobs:
         run: jq -e '.fivedive.channel | .name == "email" and (.knock.cards | has("send") and has("receive") and has("receive_unconfirmed")) and (.local_only.label | type == "string")' email/.claude-plugin/plugin.json
       - name: unit
         run: bun test tests/email.test.ts
+      # DIVE-8464: the typed fallback, the Codex adapter and the Codex mail guard.
+      - name: every setup (DIVE-8464)
+        run: bun test tests/dive8464.test.ts
+      - name: the Codex entry points the manifest names exist
+        run: jq -r '.fivedive.channel | select(.harnesses | index("codex")) | .codex_adapter, .codex_hook' email/.claude-plugin/plugin.json | while read -r f; do test -f "email/$f" || { echo "missing email/$f"; exit 1; }; done
       - name: cli
         run: sudo bash tests/cli.sh
       - name: end to end (stand-in virus scanner, no spam filter)

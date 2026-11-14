@@ -70,6 +70,12 @@ run connect max --address=$AU --provider=google --name=Max
   && ok "A1 the channel goes on through core (which allowlists it); the plugin edits no box file" || bad "A1 via core" "$(cat "$W/log")"
 [[ "$OUT" != *app-pw-1* ]] && ! grep -q app-pw-1 "$W/log" && ok "C4b the password is never printed or passed to core" || bad "C4b password leak"
 
+echo "agent types (DIVE-8464)"
+STUB_TYPE=codex run connect max --address=$A --provider=google
+[[ $RC == 0 && "$OUT" == *"now reads and answers $A"* && -s "$CFG" ]] && ok "H1 a Codex agent connects like a Claude one" || bad "H1 codex" "$RC $OUT"
+STUB_TYPE=grok run connect max --address=$A --provider=google
+[[ $RC == 3 && "$OUT" == *"Claude Code and Codex agents"* && -z "$(grep -v '^agent info' "$W/log")" ]] && ok "H2 any other agent type is refused before anything is asked of core" || bad "H2 grok" "$RC $OUT"
+
 echo "the owner's switches"
 run gate max off
 [[ $RC == 0 && "$(jq -r .approve_new "$CFG")" == false ]] && ok "G1 gate off writes approve_new:false" || bad "G1 gate off" "$RC $OUT"

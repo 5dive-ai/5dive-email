@@ -29,6 +29,8 @@
 //  15. a GTUBE mail lands in the spam folder: no card, the agent sees nothing.
 //  16. a link that shows one site and goes to another is marked suspicious.
 //  17. two strangers in a row: one card now, the second waits for the hourly slot.
+// DIVE-8464 (a Codex seat): 18. the channel as the Codex dispatcher's adapter:
+//      mail to the spool, the outbox answer out in the same thread, the door holds.
 // DNS is a stand-in file (OAMAIL_DNS_FILE). The virus scanner and spam filter are
 // the real ones when EMAIL_E2E_CLAMD (clamd socket) and EMAIL_E2E_RSPAMD (url)
 // are set (CI), else a stand-in clamd and no rspamd (only GTUBE is caught).
@@ -177,6 +179,7 @@ const outside = nodemailer.createTransport({ host: '127.0.0.1', port: MX, secure
 // A colleague's real mail: signed by example.com's DKIM key (the selector the stand-in DNS publishes).
 const signedOut = nodemailer.createTransport({ host: '127.0.0.1', port: MX, secure: false, tls: { rejectUnauthorized: false }, dkim: { domainName: 'example.com', keySelector: 'e2e', privateKey: colleagueKey } })
 const fsx = require('node:fs')
+let adapter: ReturnType<typeof Bun.spawn> | null = null
 const readOr = (p: string) => { try { return fsx.readFileSync(p, 'utf8') as string } catch { return '' } }
 
 try {
@@ -332,7 +335,57 @@ try {
   await sleep(3000)
   const held17 = fsx.readdirSync(join(state, 'held-in')).length
   check('17. two strangers in a row: one card now, the second waits for the hourly slot (both held)', (await kn()) === n17 + 1 && !readOr(join(dir, 'knocks.log')).includes(`--sender=${IVY}`) && held17 >= 2, `knocks=${(await kn()) - n17} held=${held17}`)
+
+  // 18 (DIVE-8464): the same channel on a Codex seat. The 5dive dispatcher runs
+  // it as its email adapter (no MCP): a mail becomes a spool file, the agent's
+  // answer comes back through the outbox and leaves in the same thread.
+  const disp = join(dir, 'dispatcher')
+  const annState = join(dir, 'state-ann')
+  mkdirSync(annState, { recursive: true })
+  writeFileSync(join(annState, 'config.json'), JSON.stringify({
+    address: 'ann@example.com', name: 'Ann', mode: 'local', maildir: join(dir, 'maildir-ann'),
+    smtp: { host: '127.0.0.1', port: SUB, secure: false, user: 'ann@example.com', pass: 'pw-ann' },
+    approve_new: true, allowed: [BOB],
+  }))
+  adapter = Bun.spawn(['bun', join(import.meta.dir, 'codex-adapter.ts')], {
+    env: { ...process.env, CODEX_DISPATCHER_STATE_DIR: disp, EMAIL_STATE_DIR: annState, EMAIL_SUDO: fake, EMAIL_TRANSCRIBE: TRANSCRIBER, EMAIL_5DIVE: fake5, HOME: dir },
+    stdin: 'ignore', stdout: 'ignore', stderr: 'pipe',
+  })
+  await outside.sendMail({ from: `Bob <${BOB}>`, to: 'ann@example.com', subject: 'Delivery date', text: 'When do the chairs arrive?', messageId: '<cx1@outside.test>' })
+  const spool = (): any => {
+    try {
+      for (const f of fsx.readdirSync(join(disp, 'inbox'))) {
+        const j = JSON.parse(readOr(join(disp, 'inbox', f)))
+        if (String(j.text).includes('When do the chairs arrive?')) return { f, j }
+      }
+    } catch {}
+    return undefined
+  }
+  const s18 = await until(spool)
+  check('18. Codex: the mail reaches the dispatcher spool as one email turn', !!s18 && s18.j.route?.source === 'email' && /^email-/.test(s18.j.id) && s18.f === `${s18.j.id}.json`, JSON.stringify(s18))
+  check('18b. the turn says it is outside mail and who sent it (confirmed sender)', !!s18 && s18.j.text.startsWith('[email] An email') && s18.j.text.includes(`From: Bob <${BOB}>`) && s18.j.text.includes('Sender check: confirmed'), s18?.j.text)
+  check('18c. the dispatcher stays alive: the adapter did not exit with /dev/null stdin', adapter.exitCode === null)
+  mkdirSync(join(disp, 'outbox', 'email'), { recursive: true })
+  const relayedBefore = relayed.length
+  writeFileSync(join(disp, 'outbox', 'email', '.t'), JSON.stringify({ source: 'email', chat_id: s18?.j.route.chat_id, text: 'Hi Bob,\n\nThey arrive on Friday.\n\nAnn', turnId: 'u1' }))
+  fsx.renameSync(join(disp, 'outbox', 'email', '.t'), join(disp, 'outbox', 'email', '1.json'))
+  const out18 = await until(() => relayed.slice(relayedBefore).find(x => x.to.includes(BOB) && x.raw.includes('Friday')))
+  const p18: any = out18 ? await simpleParser(out18.raw) : null
+  check('18d. the answer in the outbox goes out to the sender, same thread, from the agent', !!p18 && p18.from?.value?.[0]?.address === 'ann@example.com' && p18.inReplyTo === '<cx1@outside.test>' && p18.subject === 'Re: Delivery date', `${p18?.from?.text} ${p18?.inReplyTo} ${p18?.subject}`)
+  await until(() => !fsx.existsSync(join(disp, 'outbox', 'email', '1.json')) || undefined, 5000)
+  check('18e. the sent answer leaves the outbox', !fsx.existsSync(join(disp, 'outbox', 'email', '1.json')))
+  writeFileSync(join(disp, 'outbox', 'email', '2.json'), JSON.stringify({ source: 'email', chat_id: 'note:x', text: 'thanks' }))
+  writeFileSync(join(disp, 'outbox', 'email', '3.json'), JSON.stringify({ source: 'email', chat_id: 'no-such-thread', text: 'hello?' }))
+  await sleep(6000)
+  check('18f. an answer to a note, or to no thread, is dropped and never mailed', !fsx.existsSync(join(disp, 'outbox', 'email', '2.json')) && !fsx.existsSync(join(disp, 'outbox', 'email', '3.json')) && !relayed.slice(relayedBefore).some(x => x.raw.includes('hello?') || x.raw.includes('thanks')))
+  await outside.sendMail({ from: `Eve <${EVE}>`, to: 'ann@example.com', subject: 'Hi Ann', text: 'stranger to the codex seat' })
+  await until(() => readOr(join(dir, 'knocks.log')).includes('stranger to') || fsx.existsSync(join(annState, 'held-in')) || undefined, 8000)
+  await sleep(1500)
+  let spooledStranger = false
+  try { spooledStranger = fsx.readdirSync(join(disp, 'inbox')).some((f: string) => readOr(join(disp, 'inbox', f)).includes('stranger to the codex seat')) } catch {}
+  check('18g. the door holds on Codex too: a stranger\'s first mail never reaches the spool', !spooledStranger && fsx.existsSync(join(annState, 'held-in')) && fsx.readdirSync(join(annState, 'held-in')).length >= 1)
 } finally {
+  adapter?.kill()
   await client.close().catch(() => {})
   srv.kill()
   relay.close()
