@@ -5,10 +5,19 @@ answers in the same thread, from its own address. 5dive hosts no mail.
 
 Two ways to give an agent an address:
 
-1. **A mailbox your firm already runs** (Google Workspace or any IMAP + SMTP
-   server; Microsoft 365 needs a Microsoft sign-in that is not built yet). IT makes `mike@yourfirm.com`, then:
-   `sudo 5dive email connect mike --address=mike@yourfirm.com --provider=google --task=<DIVE-N>`
-   (the password comes through a one-time link, never on the command line).
+1. **A mailbox your firm already runs**: Microsoft 365 / Outlook, Google
+   Workspace, or any IMAP + SMTP server. IT makes `mike@yourfirm.com`, then:
+   - **Microsoft 365 / Outlook:**
+     `sudo 5dive email connect mike --address=mike@yourfirm.com --provider=microsoft --client-id=<app id>`
+     prints a Microsoft link and a short code. Whoever signs in to that mailbox
+     types the code there and signs in; run the same command again to finish.
+     The sign-in goes through an app your own IT creates once, in your own
+     Microsoft account ([docs/IT-GUIDE.md](docs/IT-GUIDE.md)), so no password
+     reaches the server and no 5dive account is involved. One app serves
+     every agent's mailbox.
+   - **Google Workspace or another server:**
+     `sudo 5dive email connect mike --address=mike@yourfirm.com --provider=google --task=<DIVE-N>`
+     (the password comes through a one-time link, never on the command line).
 2. **Your server's own mail server** (OpenAgent Mail) for a domain or subdomain
    your firm points at it, e.g. `mike@ai.yourfirm.com`:
    `sudo 5dive email server setup --domain=ai.yourfirm.com` (prints the DNS
@@ -66,6 +75,7 @@ The doors, on by default:
 Check it: `5dive email status mike`. The DNS and network steps for IT:
 [docs/IT-GUIDE.md](docs/IT-GUIDE.md).
 
-Tests (CI runs all three): `bun test tests/email.test.ts` (no dependencies),
-`sudo bash tests/cli.sh`, and `cd email && bun install && bun e2e.ts` (the whole
-path on one machine).
+Tests (CI runs them all): `bun test tests/email.test.ts` (no dependencies),
+`sudo env PATH="$PATH" bash tests/cli.sh`, and, with `cd email && bun install`,
+`bun e2e.ts` (the whole path on one machine) and `bun e2e-microsoft.ts` (a
+Microsoft 365 mailbox against stand-ins for Microsoft's sign-in, IMAP and SMTP).

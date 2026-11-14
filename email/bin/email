@@ -4,12 +4,20 @@
 # from this plugin's manifest (fivedive.channel): the launch line, the box's
 # channel allowlist, local-only and the owner's Allow/No card all come from there.
 #
-#   connect <agent> --address=<a> [--provider=google|other]   (microsoft: refused, see below)
+#   connect <agent> --address=<a> [--provider=google|other]
 #           [--imap-host=<h>] [--imap-port=993] [--smtp-host=<h>] [--smtp-port=587]
 #           [--login=<user>] [--name=<shown name>] [--task=<DIVE-N>]
 #       A mailbox the FIRM already runs. The password (or app password) arrives
 #       through a one-time link (--task) or `sudo 5dive secret write
 #       EMAIL_PASSWORD --connector=email-<agent>`, never as an argument.
+#   connect <agent> --address=<a> --provider=microsoft --client-id=<app id>
+#           [--tenant=<tenant id or domain>] [--login=<user>] [--wait]
+#       A Microsoft 365 / Outlook mailbox (DIVE-8407), signed in through the
+#       FIRM'S OWN Microsoft app (their IT registers it: docs/IT-GUIDE.md). No
+#       password: the first run prints a Microsoft link and a short code; the
+#       person who signs in as the mailbox types it there; the same connect run
+#       again (or --wait) finishes. Rerun with just --provider=microsoft to sign
+#       in again later: the app ids are kept.
 #   connect <agent> --self-hosted [--name=<shown name>]
 #       <agent>@<domain> on this box's own mail server (run `server setup` first).
 #   status <agent>
@@ -128,7 +136,7 @@ _agent_check() {  # <agent> -> prints info json
 }
 
 email_connect() {
-  local agent="" address="" provider="" ih="" ip="" sh="" sp="" login="" name="" task="" self=0 a
+  local agent="" address="" provider="" ih="" ip="" sh="" sp="" login="" name="" task="" self=0 tenant="" client="" wait=0 a
   for a in "$@"; do
     case "$a" in
       --json) FIVEDIVE_JSON_MODE=1 ;;
@@ -142,6 +150,9 @@ email_connect() {
       --login=*) login="${a#*=}" ;;
       --name=*) name="${a#*=}" ;;
       --task=*) task="${a#*=}" ;;
+      --tenant=*) tenant="${a#*=}"; tenant="${tenant,,}" ;;
+      --client-id=*) client="${a#*=}"; client="${client,,}" ;;
+      --wait) wait=1 ;;
       --password=*|--pass=*|--secret=*)
         fail "$E_VALIDATION" "the mailbox password is never an argument (it would sit in the shell history and the audit log). Rerun with --task=<DIVE-N> for a one-time link, or at a terminal: sudo 5dive secret write EMAIL_PASSWORD --connector=email-<agent>" ;;
       -*) fail "$E_USAGE" "unknown flag: $a" ;;
@@ -159,10 +170,9 @@ email_connect() {
   _addr_ok "$address" || fail "$E_VALIDATION" "--address must be the agent's email address, like mike@yourfirm.com"
   local is=true ss=false
   case "$provider" in
-    # Microsoft retired password sign-in for IMAP in 2022 (any host typed for a
-    # Microsoft 365 mailbox ends there), so a config written here could never
-    # read mail. Say so, and name what works today.
-    microsoft) fail "$E_VALIDATION" "Microsoft 365 mailboxes need the Microsoft sign-in, which is not built yet. Today: Google Workspace, any IMAP mail server, or this server's own mail server (--self-hosted) sending through your Microsoft 365 as its relay." ;;
+    # Microsoft retired password sign-in for IMAP and SMTP in 2022: a Microsoft
+    # 365 mailbox signs in through the firm's own Microsoft app (DIVE-8407).
+    microsoft) : "${ih:=outlook.office365.com}" "${sh:=smtp.office365.com}" ;;
     google) : "${ih:=imap.gmail.com}" "${sh:=smtp.gmail.com}" "${sp:=465}" ;;
     ""|other) ;;
     *) fail "$E_VALIDATION" "--provider is microsoft, google or other" ;;
@@ -178,6 +188,11 @@ email_connect() {
     if [[ -z "$addrs" ]] || grep -qvE '^(10\.|127\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.|::1$|f[cd])' <<<"$addrs"; then
       fail "$E_PERMISSION" "this server is offline and $ih is not on the office network. Use the office's own mail server, the box's own (--self-hosted), or your IT opens email alone: sudo 5dive config local-only allow email"
     fi
+  fi
+
+  if [[ "$provider" == microsoft ]]; then
+    _connect_microsoft "$agent" "$name" "$info" "$address" "$login" "$tenant" "$client" "$wait" "$ih" "$ip" "$is" "$sh" "$sp" "$ss"
+    return
   fi
 
   local secret
@@ -212,6 +227,94 @@ $name now reads and answers $address.
   Check it: 5dive email status $agent
 EOF
   return 0
+}
+
+# DIVE-8407: Microsoft 365 / Outlook. Microsoft's device-code sign-in through
+# the firm's own app (msauth.ts does the talking). Two runs: the first prints
+# the link and code and keeps the waiting sign-in (root, 0600); the second
+# (same command, or --wait) collects it, checks WHO signed in, writes config.
+_ms_pending() { printf '%s/email-%s.ms-pending.json' "$CONNECTORS_DIR" "$1"; }
+_bun() { printf '%s' "${EMAIL_BUN:-$(command -v bun || echo /usr/local/bin/bun)}"; }
+_now_ms() { echo $(( $(date +%s) * 1000 )); }
+
+_connect_microsoft() {  # <agent> <name> <info> <address> <login> <tenant> <client> <wait> <ih> <ip> <is> <sh> <sp> <ss>
+  local agent="$1" name="$2" info="$3" address="$4" login="$5" tenant="$6" client="$7" wait="$8"
+  local ih="$9" ip="${10}" is="${11}" sh="${12}" sp="${13}" ss="${14}"
+  local pend bun out rc cfg; pend=$(_ms_pending "$agent"); bun=$(_bun); cfg=$(_cfg "$agent")
+  [[ -x "$bun" ]] || fail "$E_VALIDATION" "bun is not on this server (the email channel runs on it): sudo 5dive self-update"
+  # Signing in again later: the firm's app ids are already in the config.
+  [[ -n "$client" ]] || client=$(jq -r '.oauth.client_id // empty' "$cfg" 2>/dev/null || true)
+  [[ -n "$tenant" ]] || tenant=$(jq -r '.oauth.tenant // empty' "$cfg" 2>/dev/null || true)
+  [[ -n "$tenant" ]] || tenant="${address#*@}"
+  [[ -n "$client" ]] || fail "$E_USAGE" "a Microsoft 365 mailbox signs in through your firm's own Microsoft app. Your IT creates it once (5 minutes, docs/IT-GUIDE.md in the email plugin) and gives you its Application (client) ID: --client-id=<id>"
+  [[ "$client" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]] || fail "$E_VALIDATION" "--client-id is the app's Application (client) ID, like 1b2c3d4e-0000-4000-8000-123456789abc"
+  [[ "$tenant" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]] || _domain_ok "$tenant" || fail "$E_VALIDATION" "--tenant is your firm's Directory (tenant) ID or its domain"
+
+  # A waiting sign-in for another mailbox or app, or a run-out one, is stale: start over.
+  if [[ -r "$pend" ]] && ! jq -e --arg t "$tenant" --arg c "$client" --arg a "$address" --argjson now "$(_now_ms)" \
+      '.tenant == $t and .client_id == $c and .address == $a and .expires_at > $now' "$pend" >/dev/null 2>&1; then
+    rm -f "$pend"
+  fi
+  if [[ ! -r "$pend" ]]; then
+    step "Asking Microsoft for a sign-in code (tenant $tenant)"
+    rc=0; out=$("$bun" "$EMAIL_PLUGIN_ROOT/msauth.ts" start "$tenant" "$client" "$address") || rc=$?
+    (( rc == 0 )) || fail "$E_AUTH_REQUIRED" "$(jq -r '.message // "Microsoft did not answer"' <<<"$out" 2>/dev/null || echo "Microsoft did not answer")"
+    install -d -m 700 "$CONNECTORS_DIR"
+    (umask 077; printf '%s\n' "$out" >"$pend")
+    cat <<MSG
+
+To connect $address, the person who signs in to that mailbox (or your IT):
+
+  1. opens  $(jq -r .link <<<"$out")
+  2. types  $(jq -r .user_code <<<"$out")
+  3. signs in as $address and accepts.
+
+No password comes to this server. The code works for $(( ($(jq -r .expires_at <<<"$out") - $(_now_ms)) / 60000 )) minutes.
+MSG
+    if (( ! wait )); then
+      echo "When they are done, run the same connect again." >&2
+      exit "$E_AUTH_REQUIRED"
+    fi
+  fi
+
+  local secs=$(( wait ? 900 : ${EMAIL_MS_WAIT:-90} ))
+  step "Waiting for the sign-in at Microsoft (up to $secs s)"
+  rc=0; out=$("$bun" "$EMAIL_PLUGIN_ROOT/msauth.ts" poll "$pend" "$secs") || rc=$?
+  if (( rc == 75 )); then
+    echo "Not signed in yet: open $(jq -r .link <<<"$out"), type $(jq -r .user_code <<<"$out"), sign in as $address. Then run the same connect again." >&2
+    exit "$E_AUTH_REQUIRED"
+  fi
+  rm -f "$pend"
+  (( rc == 0 )) || fail "$E_AUTH_REQUIRED" "$(jq -r '.message // "the sign-in did not finish"' <<<"$out" 2>/dev/null || echo "the sign-in did not finish"). Run the same connect again for a new code."
+  # The agent must read ITS mailbox, not the mailbox of whoever happened to sign in.
+  local who; who=$(jq -r '.who // empty' <<<"$out")
+  if [[ "$who" != "${login,,}" ]]; then
+    fail "$E_VALIDATION" "Microsoft signed in ${who:-an account it did not name}, not $login. Nothing is connected: run the same connect again and sign in as $login (if $who IS this mailbox's sign-in name, add --login=$who)."
+  fi
+
+  step "Writing $agent's email settings ($address, Microsoft sign-in)"
+  local keep; keep=$(jq -c '{approve_new, approve_inbound, allowed, daily_cap, free_domains, check_sender} | with_entries(select(.value != null))' "$cfg" 2>/dev/null || echo '{}')
+  _install_cfg "$agent" "$(jq -n --arg a "$address" --arg n "$name" --arg ih "$ih" --argjson ip "$ip" --argjson is "$is" \
+      --arg sh "$sh" --argjson sp "$sp" --argjson ss "$ss" --arg u "$login" --arg t "$tenant" --arg c "$client" \
+      --argjson keep "$keep" --argjson got "$out" '
+    {address:$a, name:$n, mode:"imap",
+     oauth:{provider:"microsoft", tenant:$t, client_id:$c, refresh_token:$got.refresh_token},
+     imap:{host:$ih, port:$ip, secure:$is, user:$u},
+     smtp:{host:$sh, port:$sp, secure:$ss, user:$u}} + $keep')"
+  out=""
+  # A password left from an earlier connect must not outlive the switch.
+  rm -f "$(_connector "$agent")"
+  _channel_on "$agent" "$info"
+  email_audit connect "$agent" "--address=$address" --provider=microsoft "--tenant=$tenant" "--client-id=$client"
+  cat <<MSG
+
+$name now reads and answers $address (Microsoft 365, signed in through your firm's own app).
+
+  Mail to $address reaches $name as a chat; $name answers in the same thread.
+  A first mail to a new outside address waits for your tap (turn off: sudo 5dive email gate $agent off).
+  Your IT can end this access any time in Microsoft Entra (remove the app, or sign the mailbox out everywhere).
+  Check it: 5dive email status $agent
+MSG
 }
 
 _connect_self() {  # <agent> <name> <info>
@@ -250,11 +353,12 @@ email_status() {
   local agent="${1:-}"
   [[ -n "$agent" ]] || fail "$E_USAGE" "usage: 5dive email status <agent>"
   _name_ok "$agent" || fail "$E_VALIDATION" "not an agent name: $agent"
-  local dir cfg connected=false address="" mode="" gate=on door=on sender=on spam=on virus=on cap=50 chans last="" held=0 held_in=0 sent=0 allowed='[]'
+  local dir cfg connected=false address="" mode="" signin="" gate=on door=on sender=on spam=on virus=on cap=50 chans last="" held=0 held_in=0 sent=0 allowed='[]'
   dir=$(_state_dir "$agent"); cfg="$dir/config.json"
   if [[ -r "$cfg" ]] && jq -e '.address and .mode and .smtp' "$cfg" >/dev/null 2>&1; then
     connected=true
     address=$(jq -r .address "$cfg"); mode=$(jq -r .mode "$cfg")
+    signin=$(jq -r 'if .oauth then "microsoft" elif .mode == "imap" then "password" else "" end' "$cfg")
     [[ "$(jq -r '.approve_new' "$cfg")" == false ]] && gate=off
     [[ "$(jq -r '.approve_inbound' "$cfg")" == false ]] && door=off
     [[ "$(jq -r '.check_sender' "$cfg")" == false ]] && sender=off
@@ -278,14 +382,14 @@ email_status() {
   if [[ "${FIVEDIVE_JSON_MODE:-0}" == 1 ]]; then
     jq -n --arg a "$agent" --argjson c "$connected" --arg ad "$address" --arg m "$mode" --arg g "$gate" --arg d "$door" --arg cap "$cap" \
       --arg ch "$chans" --arg last "$last" --argjson h "$held" --argjson hi "$held_in" --argjson s "$sent" --argjson al "$allowed" \
-      --arg sc "$sender" --arg sp "$spam" --arg vi "$virus" \
-      '{ok:true, data:{agent:$a, connected:$c, address:$ad, mode:$m, gate:$g, inbound_gate:$d, sender_check:$sc, spam_filter:$sp, virus_scan:$vi, daily_cap:($cap|tonumber? // 50), sent_today:$s, held:$h, held_inbound:$hi, channels:$ch, last_message:$last, allowed:$al}}'
+      --arg sc "$sender" --arg sp "$spam" --arg vi "$virus" --arg si "$signin" \
+      '{ok:true, data:{agent:$a, connected:$c, address:$ad, mode:$m, signin:$si, gate:$g, inbound_gate:$d, sender_check:$sc, spam_filter:$sp, virus_scan:$vi, daily_cap:($cap|tonumber? // 50), sent_today:$s, held:$h, held_inbound:$hi, channels:$ch, last_message:$last, allowed:$al}}'
     return 0
   fi
   echo "agent:      $agent"
   echo "connected:  $connected"
-  [[ "$connected" == true ]] || { echo "next:       sudo 5dive email connect $agent --address=<a> --provider=google|other   (or --self-hosted)"; return 0; }
-  echo "address:    $address ($([[ "$mode" == local ]] && echo "this box's own mail server" || echo "the firm's mailbox"))"
+  [[ "$connected" == true ]] || { echo "next:       sudo 5dive email connect $agent --address=<a> --provider=microsoft|google|other   (or --self-hosted)"; return 0; }
+  echo "address:    $address ($([[ "$mode" == local ]] && echo "this box's own mail server" || { [[ "$signin" == microsoft ]] && echo "the firm's Microsoft 365 mailbox, signed in through the firm's own app" || echo "the firm's mailbox"; }))"
   echo "channel on: $([[ ",$chans," == *",email,"* ]] && echo yes || echo "no (channels=$chans)")"
   echo "writing to: $([[ "$gate" == on ]] && echo "a first mail to a new outside address waits for your tap" || echo "mails anyone (gate off)")"
   echo "mail from:  $([[ "$door" == on ]] && echo "a first mail from someone unknown waits for your tap, unseen by $agent" || echo "anyone reaches $agent (inbound gate off)")"
@@ -320,9 +424,9 @@ email_disconnect() {
     local tmp; tmp=$(mktemp)
     jq --arg a "$agent" 'del(.agents[$a])' "$MAIL_ETC/server.json" >"$tmp" && install -m 600 "$tmp" "$MAIL_ETC/server.json"; rm -f "$tmp"
   fi
-  rm -f "$(_state_dir "$agent")/config.json" "$(_connector "$agent")"
+  rm -f "$(_state_dir "$agent")/config.json" "$(_connector "$agent")" "$(_ms_pending "$agent")"
   email_audit disconnect "$agent"
-  echo "$agent is off email. The mailbox password is deleted from this server; mail already received stays in its files."
+  echo "$agent is off email. The mailbox password or Microsoft sign-in is deleted from this server; mail already received stays in its files."
 }
 
 _cfg_set() {  # <agent> <jq filter> [jq args...] — rewrite the agent's config, keeping its owner and mode
@@ -710,6 +814,9 @@ _email_main() {
   sudo 5dive email connect <agent> --address=<a> --provider=google|other
                                  [--imap-host=<h> --smtp-host=<h>] [--task=<DIVE-N>]
                                  a mailbox your firm already runs
+  sudo 5dive email connect <agent> --address=<a> --provider=microsoft --client-id=<app id> [--tenant=<t>] [--wait]
+                                 a Microsoft 365 / Outlook mailbox: a Microsoft sign-in code, no password
+                                 (your IT creates the app once: docs/IT-GUIDE.md)
   sudo 5dive email connect <agent> --self-hosted
                                  <agent>@<domain> on this box's own mail server
   5dive email status <agent>

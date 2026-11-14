@@ -21,7 +21,8 @@ import { dirname, join } from 'node:path'
 //                  mail lands in a maildir the agent owns, and goes out through
 //                  the server's submission port on 127.0.0.1.
 
-export type Endpoint = { host: string; port: number; secure: boolean; user: string; pass: string }
+/** pass is absent on a mailbox signed in through Microsoft (Config.oauth): the token stands in for it. */
+export type Endpoint = { host: string; port: number; secure: boolean; user: string; pass?: string }
 export type Config = {
   address: string
   name?: string
@@ -40,15 +41,32 @@ export type Config = {
   /** Mails a day, all recipients counted once per mail (default 50). */
   daily_cap?: number
   poll_seconds?: number
+  /** DIVE-8407: a Microsoft 365 / Outlook mailbox, signed in through the firm's own Microsoft app (msauth.ts). */
+  oauth?: OAuth
   /** true (default) = only a mail whose sender is CONFIRMED (SPF/DKIM/DMARC, see senderCheck) counts as a colleague, a listed or a known sender; any other mail waits at the door. */
   check_sender?: boolean
 }
 
+// ── DIVE-8407: a Microsoft sign-in in the config (msauth.ts does the signing in) ──
+// Here, not in msauth.ts: the box's mail server copies only this file (email server setup).
+const GUID_RX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
+const DOMAIN_RX = /^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$/i
+export const clientIdOk = (s: unknown): s is string => typeof s === 'string' && GUID_RX.test(s)
+/** A tenant is its id (a GUID) or any domain verified in it (yourfirm.com, yourfirm.onmicrosoft.com). Never "common": the app is the firm's. */
+export const tenantOk = (s: unknown): s is string => typeof s === 'string' && (GUID_RX.test(s) || DOMAIN_RX.test(s))
+
+export type OAuth = { provider: 'microsoft'; tenant: string; client_id: string; refresh_token: string }
+
+export function oauthOk(o: any): o is OAuth {
+  return !!o && o.provider === 'microsoft' && tenantOk(o.tenant) && clientIdOk(o.client_id)
+    && typeof o.refresh_token === 'string' && o.refresh_token.length > 0
+}
+
 const HOST_RX = /^[A-Za-z0-9]([A-Za-z0-9.-]{0,251}[A-Za-z0-9])?$/
 
-function endpointOk(e: any): e is Endpoint {
+function endpointOk(e: any, token = false): e is Endpoint {
   return !!e && typeof e.host === 'string' && HOST_RX.test(e.host) && Number.isInteger(e.port) && e.port > 0 && e.port < 65536
-    && typeof e.secure === 'boolean' && typeof e.user === 'string' && typeof e.pass === 'string'
+    && typeof e.secure === 'boolean' && typeof e.user === 'string' && (token ? e.user.length > 0 : typeof e.pass === 'string')
 }
 
 export function parseConfig(raw: unknown): Config | null {
@@ -56,8 +74,11 @@ export function parseConfig(raw: unknown): Config | null {
   if (!c) return null
   if (!normAddr(c.address)) return null
   if (c.mode !== 'imap' && c.mode !== 'local') return null
-  if (!endpointOk(c.smtp)) return null
-  if (c.mode === 'imap' && !endpointOk(c.imap)) return null
+  // A Microsoft sign-in is for the firm's mailbox only, and then it is the only way in.
+  const token = c.oauth !== undefined
+  if (token && (c.mode !== 'imap' || !oauthOk(c.oauth))) return null
+  if (!endpointOk(c.smtp, token)) return null
+  if (c.mode === 'imap' && !endpointOk(c.imap, token)) return null
   if (c.mode === 'local' && (typeof c.maildir !== 'string' || !c.maildir.startsWith('/'))) return null
   return { ...c, address: normAddr(c.address)! } as Config
 }
@@ -192,6 +213,8 @@ export type State = {
   /** The newest filtered.log time already told to the owner, and when they were last told. */
   filter_told_upto?: string
   filter_told_at?: string
+  /** DIVE-8407: when the owner was told the Microsoft sign-in needs doing again (cleared once it works). */
+  signin_told_at?: string
 }
 
 export function emptyState(): State {
@@ -206,7 +229,7 @@ export function readState(raw: any): State {
   if (raw.held && typeof raw.held === 'object') s.held = raw.held
   if (raw.held_in && typeof raw.held_in === 'object') s.held_in = raw.held_in
   if (raw.sent && typeof raw.sent.day === 'string' && Number.isInteger(raw.sent.n)) s.sent = raw.sent
-  for (const k of ['door_carded_at', 'door_answered_at', 'filter_told_upto', 'filter_told_at'] as const) if (typeof raw[k] === 'string') s[k] = raw[k]
+  for (const k of ['door_carded_at', 'door_answered_at', 'filter_told_upto', 'filter_told_at', 'signin_told_at'] as const) if (typeof raw[k] === 'string') s[k] = raw[k]
   if (typeof raw.uid_validity === 'string') s.uid_validity = raw.uid_validity
   if (Number.isInteger(raw.last_uid)) s.last_uid = raw.last_uid
   return s
