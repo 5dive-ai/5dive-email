@@ -42,6 +42,10 @@ export type Config = {
   poll_seconds?: number
   /** true (default) = only a mail whose sender is CONFIRMED (SPF/DKIM/DMARC, see senderCheck) counts as a colleague, a listed or a known sender; any other mail waits at the door. */
   check_sender?: boolean
+  /** mode imap: the name the firm's mail server writes on its own sender check (the authserv-id of its Authentication-Results, e.g. "mx.firm.com", or "*.firm.com"). Google and Microsoft 365 are known; any other server's check is believed only when it carries this name. */
+  trusted_authserv_id?: string
+  /** mode imap: the mailbox is the firm's own Exchange server, whose header firewall strips X-MS-Exchange-Organization-AuthAs from outside mail (Microsoft 365 hosts are known without it). */
+  exchange?: boolean
 }
 
 const HOST_RX = /^[A-Za-z0-9]([A-Za-z0-9.-]{0,251}[A-Za-z0-9])?$/
@@ -510,6 +514,44 @@ export function senderCheck(authResults: string | undefined, from: string): Send
   if (dm && dm.result === 'fail') return { ok: false, why: `${fd} says this server may not send its mail (dmarc=fail)` }
   if (results.some(r => /^(temperror|permerror)$/.test(r.result))) return { ok: false, why: 'the sender check could not finish (DNS)' }
   return { ok: false, why: `nothing proves the mail came from ${fd}` }
+}
+
+// Which sender checks the firm's mailbox may be believed on (mode imap). A
+// header is text the SENDER can write too; only the provider's own copy, on
+// top, counts. Google stamps every mail from the internet as mx.google.com, on
+// top of anything a sender wrote. Microsoft 365 stamps its own with no
+// authserv-id, and its header firewall strips the "inside the firm" mark
+// (X-MS-Exchange-Organization-AuthAs) from outside mail. Any other server: we
+// cannot know it stamps or strips anything, so its check counts only under the
+// name the owner configured (trusted_authserv_id); else nothing is confirmed.
+const GOOGLE_IMAP = /^imap\.gmail\.com$/i
+const MS365_IMAP = /^(outlook\.office365\.com|([a-z0-9-]+\.)*outlook\.com|([a-z0-9-]+\.)*office365\.com)$/i
+export type Mailbox = { kind: 'local' | 'google' | 'microsoft' | 'exchange' | 'other'; ids: string[] }
+export function mailboxTrust(c: Config): Mailbox {
+  if (c.mode === 'local') return { kind: 'local', ids: [] }
+  const host = c.imap?.host ?? ''
+  const own = typeof c.trusted_authserv_id === 'string' && c.trusted_authserv_id.trim() ? [c.trusted_authserv_id.trim().toLowerCase()] : []
+  if (GOOGLE_IMAP.test(host)) return { kind: 'google', ids: ['mx.google.com', ...own] }
+  if (MS365_IMAP.test(host)) return { kind: 'microsoft', ids: ['', ...own] }
+  return { kind: c.exchange === true ? 'exchange' : 'other', ids: own }
+}
+const idMatches = (id: string, want: string) => want.startsWith('*.') ? id.endsWith(want.slice(1)) && id.length > want.length - 1 : id === want
+
+/** Is the From address real, by the headers the receiving server wrote? undefined = the owner turned the check off. */
+export function verifySender(raw: Buffer | string, from: string, c: Config): SenderCheck | undefined {
+  if (c.check_sender === false) return undefined
+  // Own server (mode local): mailserver.ts strips look-alikes and puts its own on top.
+  if (c.mode === 'local') return senderCheck(headerValues(raw, 'authentication-results')[0], from)
+  const box = mailboxTrust(c)
+  if ((box.kind === 'microsoft' || box.kind === 'exchange') && /^internal$/i.test(headerValues(raw, 'x-ms-exchange-organization-authas')[0] ?? '')) return { ok: true, why: 'inside the firm (Exchange)' }
+  const ar = headerValues(raw, 'authentication-results')[0]
+  // None at all on Google = it never crossed the internet: a colleague inside the same Workspace.
+  if (!ar && box.kind === 'google') return { ok: true, why: 'inside the firm (Google Workspace)' }
+  if (!ar) return senderCheck(undefined, from)
+  const id = parseAuthResults(ar).id
+  if (!box.ids.length) return { ok: false, why: `this mailbox's server is not known to check senders, so nothing proves the mail came from ${domainOf(from)}` }
+  if (!box.ids.some(w => idMatches(id, w))) return { ok: false, why: `the sender check on this mail was not written by the mailbox's own server (${id || 'unnamed'}), so nothing proves it came from ${domainOf(from)}` }
+  return senderCheck(ar, from)
 }
 
 // ── DIVE-8405: spam, viruses, phishing (own server) ──────────────────────────

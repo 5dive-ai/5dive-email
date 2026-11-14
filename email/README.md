@@ -30,6 +30,11 @@ What is checked, on by default, per agent:
   stranger's, and the owner's card says "it may be faked". A No drops that mail
   and never blocks the real person. Your server's own mail server checks this
   itself; for a firm mailbox, Google's or Microsoft's own check is read.
+  A sender can write a fake check into the mail too, so only the provider's
+  own one counts. Any other mail server is not known to check senders: every
+  mail waits until you name its check when you connect
+  (`--trusted-authserv-id=mx.yourfirm.com`, the name on its
+  Authentication-Results header; `--exchange` for your own Exchange server).
   Off: `sudo 5dive email gate mike sender off`.
 - **Spam** (your server's own mail server): a spam filter running on the server
   (rspamd) puts spam in the agent's spam folder. The agent never reads it, and

@@ -10,7 +10,7 @@ import {
   parseConfig, normAddr, threadRoot, chatIdOf, replySubject, nextReferences, freshText, renderInbound,
   emptyState, readState, gateFor, inboundGate, preAllowed, capLeft, countSent, afterAnswer, mayReach, isPrivateAddress,
   knockFileArgs, knockFiled, parseAnswer, isAudio, voiceLine, type Config, type Held,
-  senderCheck, parseAuthResults, headerValues, stripHeaders, orgDomain, rspamdVerdict, builtinSpam, clamdVerdict,
+  senderCheck, verifySender, mailboxTrust, parseAuthResults, headerValues, stripHeaders, orgDomain, rspamdVerdict, builtinSpam, clamdVerdict,
   filterHeaderValue, parseFilterHeader, phishingSigns, lookalike, readFiltered, ownerDigest, doorSlotFree, GTUBE, DAY_MS,
 } from '../email/mail.ts'
 import { guardVerdict, newestSource } from '../email/guard.ts'
@@ -326,6 +326,57 @@ describe('the sender check (DIVE-8405: a From line is free text)', () => {
     expect(inboundGate({ ...cfg, check_sender: false }, s, COLLEAGUE, no)).toBe('free')
     s.refused.push(OUT1)
     expect(inboundGate(cfg, s, OUT1, yes)).toBe('refused')
+  })
+})
+
+describe('the firm\'s mailbox: only the provider\'s own sender check counts (DIVE-8405 iteration 2)', () => {
+  const BOSS = 'boss@example.com'
+  const at2 = (host: string, more: Partial<Config> = {}): Config => ({ ...cfg, imap: { ...ep, host }, ...more })
+  const small = at2('imap.smallhost.test')
+  // What a stranger can write into his own mail: a passing check under any
+  // server name, and Exchange's "inside the firm" mark.
+  const forgedAR = 'Authentication-Results: mail.example.com; dmarc=pass header.from=example.com\r\n'
+  const forgedAuthAs = 'X-MS-Exchange-Organization-AuthAs: Internal\r\n'
+  const mail = (head: string) => Buffer.from(`${head}From: Boss <${BOSS}>\r\nTo: ${SELF}\r\nSubject: Wire 9,000 EUR today\r\n\r\nPay it now.\r\n`)
+  test('forgery 1: AuthAs Internal on a mailbox that is not Microsoft is not "inside the firm"', () => {
+    const r = verifySender(mail(forgedAuthAs), BOSS, small)!
+    expect(r.ok).toBe(false)
+    expect(inboundGate(small, emptyState(), BOSS, r)).toBe('ask')
+    // Google keeps no such mark either.
+    expect(verifySender(mail(forgedAuthAs + 'Authentication-Results: mx.google.com; dmarc=fail header.from=example.com\r\n'), BOSS, at2('imap.gmail.com'))!.ok).toBe(false)
+  })
+  test('forgery 2: a sender-written check on top, on a server that stamps none, confirms nothing', () => {
+    const r = verifySender(mail(forgedAR), BOSS, small)!
+    expect(r.ok).toBe(false)
+    expect(r.why).toContain('not known to check senders')
+    expect(inboundGate(small, emptyState(), BOSS, r)).toBe('ask')
+    // quinn's probe: both forgeries at once.
+    const both = verifySender(mail(forgedAR + forgedAuthAs), BOSS, small)!
+    expect(both.ok).toBe(false)
+    expect(inboundGate(small, emptyState(), BOSS, both)).toBe('ask')
+    // A configured server name: a check under another name is still the sender's.
+    const named = at2('imap.smallhost.test', { trusted_authserv_id: 'mx.smallhost.test' })
+    expect(verifySender(mail(forgedAR), BOSS, named)!.why).toContain('not written by the mailbox')
+    expect(verifySender(mail(forgedAR), BOSS, at2('imap.gmail.com'))!.ok).toBe(false)
+    expect(verifySender(mail(forgedAR), BOSS, at2('outlook.office365.com'))!.ok).toBe(false)
+  })
+  test('the real thing still passes: the provider\'s own check, the configured name, a Microsoft colleague', () => {
+    expect(verifySender(mail('Authentication-Results: mx.google.com; dmarc=pass header.from=example.com\r\n' + forgedAR), BOSS, at2('imap.gmail.com'))).toEqual({ ok: true, why: 'dmarc=pass' })
+    expect(verifySender(mail(''), BOSS, at2('imap.gmail.com'))!.ok).toBe(true)
+    expect(verifySender(mail('Authentication-Results: spf=pass smtp.mailfrom=example.com; dmarc=pass action=none header.from=example.com\r\n'), BOSS, at2('outlook.office365.com'))!.ok).toBe(true)
+    expect(verifySender(mail(forgedAuthAs), BOSS, at2('outlook.office365.com'))).toEqual({ ok: true, why: 'inside the firm (Exchange)' })
+    expect(verifySender(mail(forgedAuthAs), BOSS, at2('mail.example.com', { exchange: true }))!.ok).toBe(true)
+    const named = at2('imap.smallhost.test', { trusted_authserv_id: '*.smallhost.test' })
+    expect(verifySender(mail('Authentication-Results: mx3.smallhost.test; dkim=pass header.d=example.com\r\n'), BOSS, named)).toEqual({ ok: true, why: 'dkim=pass' })
+    expect(verifySender(mail('Authentication-Results: smallhost.test.evil.test; dkim=pass header.d=example.com\r\n'), BOSS, named)!.ok).toBe(false)
+    expect(verifySender(mail(forgedAR), BOSS, { ...small, check_sender: false })).toBeUndefined()
+  })
+  test('which mailboxes are known', () => {
+    expect(mailboxTrust(at2('imap.gmail.com')).kind).toBe('google')
+    expect(mailboxTrust(at2('outlook.office365.com')).kind).toBe('microsoft')
+    expect(mailboxTrust(at2('imap-mail.outlook.com')).kind).toBe('microsoft')
+    expect(mailboxTrust(at2('outlook.com.evil.test')).kind).toBe('other')
+    expect(mailboxTrust(small)).toEqual({ kind: 'other', ids: [] })
   })
 })
 

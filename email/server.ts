@@ -23,7 +23,7 @@
 //     newest message is an email, until the owner says yes on their channel.
 //
 // DIVE-8405: the door believes a From line only when the sender is confirmed
-// (mail.ts senderCheck); spam and viruses are stopped on the box's own server
+// (mail.ts verifySender); spam and viruses are stopped on the box's own server
 // before a mail lands here (mailserver.ts); phishing signs are marked to the
 // agent; "someone new wrote" cards go out at most once an hour; a blocked virus
 // is told to the owner once a day.
@@ -46,7 +46,7 @@ import {
   parseConfig, readState, trimState, remember, normAddr, threadRoot, chatIdOf, replySubject, nextReferences,
   renderInbound, gateFor, inboundGate, capLeft, countSent, afterAnswer, mayReach, SHUT_LINE, knockFileArgs, knockFiled,
   parseAnswer, messageIds, isAudio, voiceLine, MAX_VOICE_NOTES, MAX_HELD_IN, type Config, type State, type Held, type HeldIn, type Inbound,
-  senderCheck, headerValues, parseFilterHeader, phishingSigns, readFiltered, ownerDigest, doorSlotFree, domainOf, FILTER_HEADER, type SenderCheck,
+  verifySender, headerValues, parseFilterHeader, phishingSigns, readFiltered, ownerDigest, doorSlotFree, domainOf, FILTER_HEADER,
 } from './mail.ts'
 
 const STATE_DIR = process.env.EMAIL_STATE_DIR || join(homedir(), '.claude', 'channels', 'email')
@@ -343,20 +343,6 @@ async function hear(path: string): Promise<{ text: string } | { why: string }> {
   }
 }
 
-// DIVE-8405: is the From address real? The topmost Authentication-Results is
-// the receiving server's (ours in local mode; Google's / Microsoft's in imap).
-function verifySender(raw: Buffer, from: string): SenderCheck | undefined {
-  if (cfg!.check_sender === false) return undefined
-  // Exchange marks mail from inside the firm; its header firewall strips this from outside mail.
-  if (cfg!.mode === 'imap' && /^internal$/i.test(headerValues(raw, 'x-ms-exchange-organization-authas')[0] ?? '')) return { ok: true, why: 'inside the firm (Exchange)' }
-  const ar = headerValues(raw, 'authentication-results')[0]
-  // Google stamps every mail that reaches it over the internet (and stacks its
-  // own on top of any a sender wrote). None at all = it never crossed the
-  // internet: a colleague inside the same Google Workspace.
-  if (!ar && cfg!.mode === 'imap' && /^imap\.gmail\.com$/i.test(cfg!.imap!.host)) return { ok: true, why: 'inside the firm (Google Workspace)' }
-  return senderCheck(ar, from)
-}
-
 const safeName = (s: string) => (s || 'file').replace(/[^A-Za-z0-9._-]+/g, '_').replace(/^\.+/, '').slice(0, 80) || 'file'
 
 // release = the owner allowed a mail held at the door: it was seen once already.
@@ -394,7 +380,7 @@ async function takeMail(raw: Buffer, release = false) {
   }
   // The door: a first mail from someone unknown never reaches the agent until
   // the owner says so; nor does one whose sender could not be confirmed.
-  const check = verifySender(raw, fromAddr)
+  const check = verifySender(raw, fromAddr, cfg!)
   if (!release) {
     const g = inboundGate(cfg!, state, fromAddr, check)
     if (g === 'refused') {

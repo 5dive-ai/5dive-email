@@ -96,6 +96,19 @@ run gate max sender off
 [[ $RC == 0 && "$(jq -r .check_sender "$CFG")" == false && "$OUT" == *"faked colleague"* ]] && ok "G8 gate sender off writes check_sender:false and says what it opens" || bad "G8 sender off" "$RC $OUT"
 run gate max spam off
 [[ $RC == 3 && "$OUT" == *"provider filters spam itself"* ]] && ok "G9 spam gate on a firm mailbox is refused: the provider filters" || bad "G9 spam on imap" "$RC $OUT"
+# DIVE-8405 iteration 2: an unknown mail server's sender check is believed only under the name the owner gives.
+run gate max sender on
+run connect max --address=$A --imap-host=mail.example.com --smtp-host=mail.example.com
+[[ $RC == 0 && "$OUT" == *"not known to confirm senders"* && "$(jq -r '.trusted_authserv_id // "none"' "$CFG")" == none ]] \
+  && ok "G14 an unknown mail server: connect says every mail waits until its sender check is named" || bad "G14 unknown server" "$RC $OUT"
+run connect max --address=$A --imap-host=mail.example.com --smtp-host=mail.example.com --trusted-authserv-id=MX.Example.com --exchange
+[[ $RC == 0 && "$OUT" != *"not known to confirm senders"* && "$(jq -c '[.trusted_authserv_id,.exchange]' "$CFG")" == '["mx.example.com",true]' ]] \
+  && ok "G15 --trusted-authserv-id and --exchange are written (lower-cased) and the warning goes" || bad "G15 trusted id" "$RC $OUT $(cat "$CFG")"
+run connect max --address=$A --imap-host=mail.example.com --smtp-host=mail.example.com
+[[ $RC == 0 && "$(jq -c '[.trusted_authserv_id,.exchange]' "$CFG")" == '["mx.example.com",true]' ]] && ok "G15b a re-run of connect keeps them" || bad "G15b keep" "$(cat "$CFG")"
+run connect max --address=$A --imap-host=mail.example.com --smtp-host=mail.example.com '--trusted-authserv-id=mx.example.com;x'
+[[ $RC == 3 && "$(jq -r .trusted_authserv_id "$CFG")" == mx.example.com ]] && ok "G16 a bad server name is refused, nothing changed" || bad "G16 bad id" "$RC $OUT"
+run gate max sender off   # S2c reads it back after a self-hosted connect
 
 echo "the Resend preset (optional; direct sending stays the default)"
 run server setup --domain=example.com --relay=resend

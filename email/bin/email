@@ -7,6 +7,12 @@
 #   connect <agent> --address=<a> [--provider=google|other]   (microsoft: refused, see below)
 #           [--imap-host=<h>] [--imap-port=993] [--smtp-host=<h>] [--smtp-port=587]
 #           [--login=<user>] [--name=<shown name>] [--task=<DIVE-N>]
+#           [--trusted-authserv-id=<name>] [--exchange]
+#       --trusted-authserv-id: the name the firm's mail server writes on its own
+#       sender check (Authentication-Results), e.g. mx.firm.com or *.firm.com.
+#       Google and Microsoft 365 are known; on any other server a sender is
+#       confirmed only under this name. --exchange: the firm's own Exchange
+#       server (it strips the "inside the firm" mark from outside mail).
 #       A mailbox the FIRM already runs. The password (or app password) arrives
 #       through a one-time link (--task) or `sudo 5dive secret write
 #       EMAIL_PASSWORD --connector=email-<agent>`, never as an argument.
@@ -128,7 +134,7 @@ _agent_check() {  # <agent> -> prints info json
 }
 
 email_connect() {
-  local agent="" address="" provider="" ih="" ip="" sh="" sp="" login="" name="" task="" self=0 a
+  local agent="" address="" provider="" ih="" ip="" sh="" sp="" login="" name="" task="" self=0 a asid="" exch=""
   for a in "$@"; do
     case "$a" in
       --json) FIVEDIVE_JSON_MODE=1 ;;
@@ -142,6 +148,8 @@ email_connect() {
       --login=*) login="${a#*=}" ;;
       --name=*) name="${a#*=}" ;;
       --task=*) task="${a#*=}" ;;
+      --trusted-authserv-id=*) asid="${a#*=}"; asid="${asid,,}" ;;
+      --exchange) exch=true ;;
       --password=*|--pass=*|--secret=*)
         fail "$E_VALIDATION" "the mailbox password is never an argument (it would sit in the shell history and the audit log). Rerun with --task=<DIVE-N> for a one-time link, or at a terminal: sudo 5dive secret write EMAIL_PASSWORD --connector=email-<agent>" ;;
       -*) fail "$E_USAGE" "unknown flag: $a" ;;
@@ -171,6 +179,7 @@ email_connect() {
   [[ -n "$ih" && -n "$sh" ]] || fail "$E_USAGE" "give the firm's mail servers: --imap-host=<h> --smtp-host=<h> (or --provider=microsoft|google)"
   _host_ok "$ih" && _host_ok "$sh" || fail "$E_VALIDATION" "not a host name"
   _port_ok "$ip" && _port_ok "$sp" || fail "$E_VALIDATION" "not a port"
+  [[ -z "$asid" || "$asid" =~ ^(\*\.)?[a-z0-9]([a-z0-9.-]{0,251}[a-z0-9])?$ ]] || fail "$E_VALIDATION" "--trusted-authserv-id is a server name like mx.firm.com or *.firm.com"
   [[ "$ip" == 143 ]] && is=false
   [[ "$sp" == 465 ]] && ss=true
   if _offline; then
@@ -194,7 +203,9 @@ email_connect() {
   fi
 
   step "Writing $agent's email settings ($address)"
-  local keep; keep=$(jq -c '{approve_new, approve_inbound, allowed, daily_cap, free_domains, check_sender} | with_entries(select(.value != null))' "$(_cfg "$agent")" 2>/dev/null || echo '{}')
+  local keep; keep=$(jq -c '{approve_new, approve_inbound, allowed, daily_cap, free_domains, check_sender, trusted_authserv_id, exchange} | with_entries(select(.value != null))' "$(_cfg "$agent")" 2>/dev/null || echo '{}')
+  [[ -n "$asid" ]] && keep=$(jq -c --arg v "$asid" '.trusted_authserv_id = $v' <<<"$keep")
+  [[ -n "$exch" ]] && keep=$(jq -c '.exchange = true' <<<"$keep")
   _install_cfg "$agent" "$(jq -n --arg a "$address" --arg n "$name" --arg ih "$ih" --argjson ip "$ip" --argjson is "$is" \
       --arg sh "$sh" --argjson sp "$sp" --argjson ss "$ss" --arg u "$login" --arg pw "$secret" --argjson keep "$keep" '
     {address:$a, name:$n, mode:"imap",
@@ -211,6 +222,16 @@ $name now reads and answers $address.
   A first mail to a new outside address waits for your tap (turn off: sudo 5dive email gate $agent off).
   Check it: 5dive email status $agent
 EOF
+  # DIVE-8405: a mail server we do not know may stamp no sender check at all,
+  # and then the topmost one is whatever the sender wrote. Say what follows.
+  if [[ ! "${ih,,}" =~ ^(imap\.gmail\.com|outlook\.office365\.com|([a-z0-9-]+\.)*outlook\.com|([a-z0-9-]+\.)*office365\.com)$ ]] \
+     && [[ "$(jq -r '.check_sender' "$(_cfg "$agent")")" != false ]] && [[ -z "$(jq -r '.trusted_authserv_id // empty' "$(_cfg "$agent")")" ]]; then
+    cat <<EOF
+  This mail server is not known to confirm senders, so every mail waits for your tap.
+  Name its sender check (connect again with --trusted-authserv-id=<the name on its Authentication-Results>),
+  or believe From lines as written: sudo 5dive email gate $agent sender off
+EOF
+  fi
   return 0
 }
 
@@ -229,7 +250,7 @@ _connect_self() {  # <agent> <name> <info>
   jq --arg a "$agent" --arg m "$box" --argjson u "$uid" --argjson g "$gid" --arg h "$hash" \
     '.agents[$a] = {maildir:$m, uid:$u, gid:$g, pass_sha256:$h}' "$conf" >"$tmp" && install -m 600 "$tmp" "$conf"
   rm -f "$tmp"
-  local keep; keep=$(jq -c '{approve_new, approve_inbound, allowed, daily_cap, free_domains, check_sender} | with_entries(select(.value != null))' "$(_cfg "$agent")" 2>/dev/null || echo '{}')
+  local keep; keep=$(jq -c '{approve_new, approve_inbound, allowed, daily_cap, free_domains, check_sender, trusted_authserv_id, exchange} | with_entries(select(.value != null))' "$(_cfg "$agent")" 2>/dev/null || echo '{}')
   _install_cfg "$agent" "$(jq -n --arg a "$address" --arg n "$name" --arg m "$box" --arg pw "$pass" --argjson keep "$keep" '
     {address:$a, name:$n, mode:"local", maildir:$m,
      smtp:{host:"127.0.0.1", port:587, secure:false, user:$a, pass:$pw}} + $keep')"
@@ -709,6 +730,7 @@ _email_main() {
 
   sudo 5dive email connect <agent> --address=<a> --provider=google|other
                                  [--imap-host=<h> --smtp-host=<h>] [--task=<DIVE-N>]
+                                 [--trusted-authserv-id=<name>] [--exchange]
                                  a mailbox your firm already runs
   sudo 5dive email connect <agent> --self-hosted
                                  <agent>@<domain> on this box's own mail server
