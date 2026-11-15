@@ -176,14 +176,15 @@ email_connect() {
   name=$(printf '%s' "$name" | tr -d '\000-\037"' | cut -c1-64)
   (( self )) && { _connect_self "$agent" "$name" "$info"; return; }
 
-  [[ -n "$address" ]] || address=$(jq -r '.address // empty' "$(_cfg "$agent")" 2>/dev/null || true)
-  # Finishing a sign-in link (--code): the mailbox and the firm's app are the ones the link was made for.
+  # Finishing a sign-in link (--code): the mailbox and the firm's app are the ones
+  # the link was made for, ahead of the mailbox connected now (it may be switching).
   if [[ -n "$code" && "$provider" == microsoft && -r "$(_ms_pending "$agent")" ]]; then
     local pf; pf=$(_ms_pending "$agent")
     [[ -n "$address" ]] || address=$(jq -r '.address // empty' "$pf")
     [[ -n "$client" ]] || client=$(jq -r '.client_id // empty' "$pf")
     [[ -n "$tenant" ]] || tenant=$(jq -r '.tenant // empty' "$pf")
   fi
+  [[ -n "$address" ]] || address=$(jq -r '.address // empty' "$(_cfg "$agent")" 2>/dev/null || true)
   _addr_ok "$address" || fail "$E_VALIDATION" "--address must be the agent's email address, like mike@yourfirm.com"
   local is=true ss=false
   case "$provider" in

@@ -335,6 +335,14 @@ else
   [[ $RC == 6 && "$OUT" == *"new link"* && ! -e "$PEND" && "$(jq -r .oauth.refresh_token "$CFG")" == "$RT" ]] \
     && ok "MS18 a code Microsoft no longer takes (used, or over 10 minutes): asks for a new link, the working sign-in untouched" || bad "MS18 expired code" "$RC $OUT"
   ctl '{"code_error":null}'
+  # Switching mailbox: the config holds max@, the link is for desk@; --code alone must finish desk@ (found live).
+  run connect max --address=desk@example.com --provider=microsoft --client-id=$APP
+  Q=$(jq -r .link "$PEND"); Q="${Q#*\?}"; ST=$(qp state); CH=$(qp code_challenge)
+  ctl "{\"code\":\"ac-5\",\"challenge\":\"$CH\",\"who\":\"desk@example.com\"}"
+  run connect max --provider=microsoft --code="https://login.microsoftonline.com/common/oauth2/nativeclient?code=ac-5&state=$ST"
+  [[ $RC == 0 && "$(jq -r '[.address,.imap.user] | join(" ")' "$CFG")" == "desk@example.com desk@example.com" && ! -e "$PEND" ]] \
+    && ok "MS20 switching mailbox: --code alone finishes the mailbox the link was made for, not the one connected now" || bad "MS20 switch" "$RC $OUT $(jq -c . "$CFG")"
+  rm -f "$PEND"
   run connect max --provider=microsoft --code="https://login.microsoftonline.com/common/oauth2/nativeclient?code=ac-4"
   [[ $RC == 2 && "$OUT" == *"no Microsoft sign-in is waiting"* ]] && ok "MS19 --code with no link waiting: says to make one first" || bad "MS19 no pending" "$RC $OUT"
 fi
