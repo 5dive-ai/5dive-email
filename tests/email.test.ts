@@ -377,6 +377,10 @@ describe('the firm\'s mailbox: only the provider\'s own sender check counts (DIV
     expect(mailboxTrust(at2('imap-mail.outlook.com')).kind).toBe('microsoft')
     expect(mailboxTrust(at2('outlook.com.evil.test')).kind).toBe('other')
     expect(mailboxTrust(small)).toEqual({ kind: 'other', ids: [] })
+    // DIVE-8407: what Exchange Online really stamps (seen live): "mx.microsoft.com 1; ...".
+    const msLive = 'Authentication-Results: mx.microsoft.com 1; spf=pass (sender IP is 192.0.2.7) smtp.mailfrom=example.com; dkim=pass (signature was verified) header.d=example.com;dmarc=pass action=none header.from=example.com;compauth=pass reason=100\r\n'
+    expect(verifySender(mail(msLive), BOSS, at2('outlook.office365.com'))!.ok).toBe(true)
+    expect(verifySender(mail(msLive.replace('mx.microsoft.com', 'mx.evil.test')), BOSS, at2('outlook.office365.com'))!.ok).toBe(false)
     // DIVE-8407: a mailbox signed in through Microsoft is Microsoft 365, even on a host name we do not list.
     const ms = at2('mail.firm.test', { oauth: { provider: 'microsoft', tenant: 'firm.test', client_id: '1b2c3d4e-0000-4000-8000-123456789abc', refresh_token: 'rt' } } as any)
     expect(mailboxTrust(ms).kind).toBe('microsoft')

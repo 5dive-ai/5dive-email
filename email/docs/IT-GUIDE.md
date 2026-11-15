@@ -25,10 +25,12 @@ serves every agent's mailbox in your firm.
 **1. Create the app.** In the Microsoft Entra admin center (entra.microsoft.com):
 
 1. App registrations > New registration. Name: `AI employees email`.
-   Who can use it: "Accounts in this organizational directory only".
-   No redirect URI. Register.
+   Supported account types: "Single tenant only" (this organization only).
+   Redirect URI: platform **Public client/native (mobile & desktop)**, value
+   `https://login.microsoftonline.com/common/oauth2/nativeclient`. Register.
 2. Copy the **Application (client) ID** and the **Directory (tenant) ID**.
-3. Authentication > "Allow public client flows": **Yes**. Save.
+3. Authentication > "Allow public client flows": **Yes**. Save. (Only the
+   `--device-code` sign-in below needs it; it does no harm otherwise.)
 4. API permissions > Add a permission > Microsoft Graph > Delegated permissions:
    `IMAP.AccessAsUser.All`, `SMTP.Send`, `offline_access`, `openid`, `email`.
    Then **Grant admin consent** for your organization.
@@ -38,7 +40,9 @@ Or the same in one go with the Azure CLI (as an admin):
 ```
 az login --allow-no-subscriptions
 APP=$(az ad app create --display-name "AI employees email" --sign-in-audience AzureADMyOrg \
-      --is-fallback-public-client true --query appId -o tsv)
+      --is-fallback-public-client true \
+      --public-client-redirect-uris https://login.microsoftonline.com/common/oauth2/nativeclient \
+      --query appId -o tsv)
 az ad app permission add --id "$APP" --api 00000003-0000-0000-c000-000000000000 --api-permissions \
   652390e4-393a-48de-9484-05f9b1212954=Scope 258f6531-6087-4cc4-bb90-092c5fb3ed3f=Scope \
   7427e0e9-2fba-42fe-b0c0-848c9e6a8182=Scope 37f7f235-527c-4136-accd-4a02d197296e=Scope \
@@ -62,16 +66,27 @@ SMTP**. Or in Exchange Online PowerShell:
 Set-CASMailbox -Identity mike@yourfirm.com -ImapEnabled $true -SmtpClientAuthenticationDisabled $false
 ```
 
-If a Conditional Access policy blocks "device code flow", exclude this app (or
-the agent's account) from it.
+The agent's mailbox signs in like any person in your firm, so it needs its
+second factor set up (Microsoft asks at its first sign-in when security
+defaults are on): keep that authenticator with whoever looks after the
+mailbox.
 
 **3. Connect.** The owner runs
 `sudo 5dive email connect mike --address=mike@yourfirm.com --provider=microsoft --client-id=<Application id> --tenant=<Directory id>`.
-It prints `https://microsoft.com/devicelogin` and a short code. Whoever holds
-the agent mailbox's sign-in opens the link, types the code, signs in as
-`mike@yourfirm.com` (with its second factor, if you use one) and accepts. The
-owner runs the same command again to finish. The server checks that the
-account that signed in IS the agent's mailbox, and refuses any other.
+It prints a Microsoft sign-in link. Whoever holds the agent mailbox's sign-in
+opens it, signs in as `mike@yourfirm.com` and accepts. Microsoft then shows an
+empty page: they copy the whole address from the browser's address bar and
+send it to the owner within 10 minutes, who finishes with
+`sudo 5dive email connect mike --provider=microsoft --code='<that address>'`.
+The code in that address works once, for minutes, and only on this server (it
+needs a secret that never leaves it). The server checks that the account that
+signed in IS the agent's mailbox, and refuses any other.
+
+Why a link and not a short code: Microsoft's security defaults, on in most
+small tenants, refuse the short-code ("device code") sign-in for every user
+(error 530035), and only a paid Conditional Access licence can exempt one app.
+If your policies allow it, `--device-code` prints `https://microsoft.com/devicelogin`
+and a code to type instead; run the same command again to finish.
 
 What stays on the server: a Microsoft sign-in token for that one mailbox, in
 the agent's own settings file, readable only by the agent. No password.

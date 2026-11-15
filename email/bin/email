@@ -17,13 +17,15 @@
 #       through a one-time link (--task) or `sudo 5dive secret write
 #       EMAIL_PASSWORD --connector=email-<agent>`, never as an argument.
 #   connect <agent> --address=<a> --provider=microsoft --client-id=<app id>
-#           [--tenant=<tenant id or domain>] [--login=<user>] [--wait]
+#           [--tenant=<tenant id or domain>] [--login=<user>] [--code=<page address>]
+#           [--device-code [--wait]]
 #       A Microsoft 365 / Outlook mailbox (DIVE-8407), signed in through the
 #       FIRM'S OWN Microsoft app (their IT registers it: docs/IT-GUIDE.md). No
-#       password: the first run prints a Microsoft link and a short code; the
-#       person who signs in as the mailbox types it there; the same connect run
-#       again (or --wait) finishes. Rerun with just --provider=microsoft to sign
-#       in again later: the app ids are kept.
+#       password: the first run prints a Microsoft sign-in link; the person who
+#       signs in as the mailbox sends back the address of the empty page it
+#       lands on, and connect --code=<that address> finishes. --device-code
+#       uses a short code instead, which Microsoft's security defaults refuse.
+#       Rerun with just --provider=microsoft to sign in again later: the app ids are kept.
 #   connect <agent> --self-hosted [--name=<shown name>]
 #       <agent>@<domain> on this box's own mail server (run `server setup` first).
 #   status <agent>
@@ -921,8 +923,9 @@ _email_main() {
                                  [--imap-host=<h> --smtp-host=<h>] [--task=<DIVE-N>]
                                  [--trusted-authserv-id=<name>] [--exchange]
                                  a mailbox your firm already runs
-  sudo 5dive email connect <agent> --address=<a> --provider=microsoft --client-id=<app id> [--tenant=<t>] [--wait]
-                                 a Microsoft 365 / Outlook mailbox: a Microsoft sign-in code, no password
+  sudo 5dive email connect <agent> --address=<a> --provider=microsoft --client-id=<app id> [--tenant=<t>]
+                                 a Microsoft 365 / Outlook mailbox: a Microsoft sign-in link, no password;
+                                 finish with --code='<the address of the page it lands on>'
                                  (your IT creates the app once: docs/IT-GUIDE.md)
   sudo 5dive email connect <agent> --self-hosted
                                  <agent>@<domain> on this box's own mail server

@@ -9,8 +9,9 @@ Two ways to give an agent an address:
    Workspace, or any IMAP + SMTP server. IT makes `mike@yourfirm.com`, then:
    - **Microsoft 365 / Outlook:**
      `sudo 5dive email connect mike --address=mike@yourfirm.com --provider=microsoft --client-id=<app id>`
-     prints a Microsoft link and a short code. Whoever signs in to that mailbox
-     types the code there and signs in; run the same command again to finish.
+     prints a Microsoft sign-in link. Whoever signs in to that mailbox opens it,
+     signs in, and sends back the address of the empty page Microsoft shows;
+     finish with the same command and `--code='<that address>'`.
      The sign-in goes through an app your own IT creates once, in your own
      Microsoft account ([docs/IT-GUIDE.md](docs/IT-GUIDE.md)), so no password
      reaches the server and no 5dive account is involved. One app serves

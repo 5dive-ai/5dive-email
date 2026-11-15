@@ -542,8 +542,8 @@ export function senderCheck(authResults: string | undefined, from: string): Send
 // Which sender checks the firm's mailbox may be believed on (mode imap). A
 // header is text the SENDER can write too; only the provider's own copy, on
 // top, counts. Google stamps every mail from the internet as mx.google.com, on
-// top of anything a sender wrote. Microsoft 365 stamps its own with no
-// authserv-id, and its header firewall strips the "inside the firm" mark
+// top of anything a sender wrote. Microsoft 365 stamps its own as
+// "mx.microsoft.com 1" (seen live, DIVE-8407; older mail: no authserv-id), and its header firewall strips the "inside the firm" mark
 // (X-MS-Exchange-Organization-AuthAs) from outside mail. Any other server: we
 // cannot know it stamps or strips anything, so its check counts only under the
 // name the owner configured (trusted_authserv_id); else nothing is confirmed.
@@ -556,7 +556,7 @@ export function mailboxTrust(c: Config): Mailbox {
   const own = typeof c.trusted_authserv_id === 'string' && c.trusted_authserv_id.trim() ? [c.trusted_authserv_id.trim().toLowerCase()] : []
   if (GOOGLE_IMAP.test(host)) return { kind: 'google', ids: ['mx.google.com', ...own] }
   // A Microsoft sign-in (oauth) only opens an Exchange Online mailbox: Microsoft 365 whatever the host is named.
-  if (MS365_IMAP.test(host) || c.oauth?.provider === 'microsoft') return { kind: 'microsoft', ids: ['', ...own] }
+  if (MS365_IMAP.test(host) || c.oauth?.provider === 'microsoft') return { kind: 'microsoft', ids: ['mx.microsoft.com', '', ...own] }
   return { kind: c.exchange === true ? 'exchange' : 'other', ids: own }
 }
 const idMatches = (id: string, want: string) => want.startsWith('*.') ? id.endsWith(want.slice(1)) && id.length > want.length - 1 : id === want
