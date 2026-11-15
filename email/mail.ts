@@ -555,7 +555,8 @@ export function mailboxTrust(c: Config): Mailbox {
   const host = c.imap?.host ?? ''
   const own = typeof c.trusted_authserv_id === 'string' && c.trusted_authserv_id.trim() ? [c.trusted_authserv_id.trim().toLowerCase()] : []
   if (GOOGLE_IMAP.test(host)) return { kind: 'google', ids: ['mx.google.com', ...own] }
-  if (MS365_IMAP.test(host)) return { kind: 'microsoft', ids: ['', ...own] }
+  // A Microsoft sign-in (oauth) only opens an Exchange Online mailbox: Microsoft 365 whatever the host is named.
+  if (MS365_IMAP.test(host) || c.oauth?.provider === 'microsoft') return { kind: 'microsoft', ids: ['', ...own] }
   return { kind: c.exchange === true ? 'exchange' : 'other', ids: own }
 }
 const idMatches = (id: string, want: string) => want.startsWith('*.') ? id.endsWith(want.slice(1)) && id.length > want.length - 1 : id === want

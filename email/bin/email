@@ -391,6 +391,7 @@ email_status() {
     # exchange = only mail from inside the firm is confirmed. The app says so on its email sheet.
     if [[ "$mode" == local ]]; then server=own
     elif [[ -n "$(jq -r '.trusted_authserv_id // empty' "$cfg")" ]]; then server=known
+    elif [[ "$(jq -r '.oauth.provider // empty' "$cfg")" == microsoft ]]; then server=known
     elif [[ "$(jq -r '.imap.host // "" | ascii_downcase' "$cfg")" =~ ^(imap\.gmail\.com|outlook\.office365\.com|([a-z0-9-]+\.)*outlook\.com|([a-z0-9-]+\.)*office365\.com)$ ]]; then server=known
     elif [[ "$(jq -r '.exchange' "$cfg")" == true ]]; then server=exchange
     else server=unknown
