@@ -142,7 +142,7 @@ _agent_check() {  # <agent> -> prints info json
 }
 
 email_connect() {
-  local agent="" address="" provider="" ih="" ip="" sh="" sp="" login="" name="" task="" self=0 a asid="" exch="" tenant="" client="" wait=0
+  local agent="" address="" provider="" ih="" ip="" sh="" sp="" login="" name="" task="" self=0 a asid="" exch="" tenant="" client="" wait=0 code="" dev=0
   for a in "$@"; do
     case "$a" in
       --json) FIVEDIVE_JSON_MODE=1 ;;
@@ -161,6 +161,8 @@ email_connect() {
       --tenant=*) tenant="${a#*=}"; tenant="${tenant,,}" ;;
       --client-id=*) client="${a#*=}"; client="${client,,}" ;;
       --wait) wait=1 ;;
+      --code=*) code="${a#*=}" ;;
+      --device-code) dev=1 ;;
       --password=*|--pass=*|--secret=*)
         fail "$E_VALIDATION" "the mailbox password is never an argument (it would sit in the shell history and the audit log). Rerun with --task=<DIVE-N> for a one-time link, or at a terminal: sudo 5dive secret write EMAIL_PASSWORD --connector=email-<agent>" ;;
       -*) fail "$E_USAGE" "unknown flag: $a" ;;
@@ -175,6 +177,13 @@ email_connect() {
   (( self )) && { _connect_self "$agent" "$name" "$info"; return; }
 
   [[ -n "$address" ]] || address=$(jq -r '.address // empty' "$(_cfg "$agent")" 2>/dev/null || true)
+  # Finishing a sign-in link (--code): the mailbox and the firm's app are the ones the link was made for.
+  if [[ -n "$code" && "$provider" == microsoft && -r "$(_ms_pending "$agent")" ]]; then
+    local pf; pf=$(_ms_pending "$agent")
+    [[ -n "$address" ]] || address=$(jq -r '.address // empty' "$pf")
+    [[ -n "$client" ]] || client=$(jq -r '.client_id // empty' "$pf")
+    [[ -n "$tenant" ]] || tenant=$(jq -r '.tenant // empty' "$pf")
+  fi
   _addr_ok "$address" || fail "$E_VALIDATION" "--address must be the agent's email address, like mike@yourfirm.com"
   local is=true ss=false
   case "$provider" in
@@ -200,7 +209,7 @@ email_connect() {
   fi
 
   if [[ "$provider" == microsoft ]]; then
-    _connect_microsoft "$agent" "$name" "$info" "$address" "$login" "$tenant" "$client" "$wait" "$ih" "$ip" "$is" "$sh" "$sp" "$ss"
+    _connect_microsoft "$agent" "$name" "$info" "$address" "$login" "$tenant" "$client" "$wait" "$ih" "$ip" "$is" "$sh" "$sp" "$ss" "$code" "$dev"
     return
   fi
 
@@ -258,24 +267,57 @@ _ms_pending() { printf '%s/email-%s.ms-pending.json' "$CONNECTORS_DIR" "$1"; }
 _bun() { printf '%s' "${EMAIL_BUN:-$(command -v bun || echo /usr/local/bin/bun)}"; }
 _now_ms() { echo $(( $(date +%s) * 1000 )); }
 
-_connect_microsoft() {  # <agent> <name> <info> <address> <login> <tenant> <client> <wait> <ih> <ip> <is> <sh> <sp> <ss>
-  local agent="$1" name="$2" info="$3" address="$4" login="$5" tenant="$6" client="$7" wait="$8"
-  local ih="$9" ip="${10}" is="${11}" sh="${12}" sp="${13}" ss="${14}"
-  local pend bun out rc cfg; pend=$(_ms_pending "$agent"); bun=$(_bun); cfg=$(_cfg "$agent")
-  [[ -x "$bun" ]] || fail "$E_VALIDATION" "bun is not on this server (the email channel runs on it): sudo 5dive self-update"
-  # Signing in again later: the firm's app ids are already in the config.
-  [[ -n "$client" ]] || client=$(jq -r '.oauth.client_id // empty' "$cfg" 2>/dev/null || true)
-  [[ -n "$tenant" ]] || tenant=$(jq -r '.oauth.tenant // empty' "$cfg" 2>/dev/null || true)
-  [[ -n "$tenant" ]] || tenant="${address#*@}"
-  [[ -n "$client" ]] || fail "$E_USAGE" "a Microsoft 365 mailbox signs in through your firm's own Microsoft app. Your IT creates it once (5 minutes, docs/IT-GUIDE.md in the email plugin) and gives you its Application (client) ID: --client-id=<id>"
-  [[ "$client" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]] || fail "$E_VALIDATION" "--client-id is the app's Application (client) ID, like 1b2c3d4e-0000-4000-8000-123456789abc"
-  [[ "$tenant" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]] || _domain_ok "$tenant" || fail "$E_VALIDATION" "--tenant is your firm's Directory (tenant) ID or its domain"
+# The sign-in link (the default, DIVE-8407): Microsoft's security defaults, on in
+# most small tenants, refuse the device code (AADSTS530035) for every user. The
+# person opens the link, signs in, and sends back the address of the empty
+# Microsoft page they land on. Leaves Microsoft's answer in "$pend.done", or exits.
+_ms_link() {  # <agent> <address> <login> <tenant> <client> <code> <pend>
+  local agent="$1" address="$2" login="$3" tenant="$4" client="$5" code="$6" pend="$7" bun out rc; bun=$(_bun)
+  local again="sudo 5dive email connect $agent --provider=microsoft --code='<the address they sent>'"
+  if [[ -z "$code" ]]; then
+    if [[ ! -r "$pend" ]]; then
+      step "Making a Microsoft sign-in link (tenant $tenant)"
+      rc=0; out=$("$bun" "$EMAIL_PLUGIN_ROOT/msauth.ts" link "$tenant" "$client" "$address") || rc=$?
+      (( rc == 0 )) || fail "$E_AUTH_REQUIRED" "$(jq -r '.message // "the sign-in link could not be made"' <<<"$out" 2>/dev/null || echo "the sign-in link could not be made")"
+      install -d -m 700 "$CONNECTORS_DIR"
+      (umask 077; printf '%s\n' "$out" >"$pend")
+    fi
+    cat <<MSG
 
-  # A waiting sign-in for another mailbox or app, or a run-out one, is stale: start over.
-  if [[ -r "$pend" ]] && ! jq -e --arg t "$tenant" --arg c "$client" --arg a "$address" --argjson now "$(_now_ms)" \
-      '.tenant == $t and .client_id == $c and .address == $a and .expires_at > $now' "$pend" >/dev/null 2>&1; then
-    rm -f "$pend"
+To connect $address, the person who signs in to that mailbox (or your IT):
+
+  1. opens this link:
+     $(jq -r .link "$pend")
+  2. signs in as $login and accepts.
+  3. lands on an empty Microsoft page: copies the whole address from the
+     browser's address bar and sends it back within 10 minutes.
+
+Then: $again
+
+No password comes to this server. The address they send works once, and only
+on this server. The link works for $(( ($(jq -r .expires_at "$pend") - $(_now_ms)) / 60000 )) minutes.
+MSG
+    exit "$E_AUTH_REQUIRED"
   fi
+  [[ -r "$pend" ]] || fail "$E_USAGE" "no Microsoft sign-in is waiting on this server (or its link expired). Run the same connect without --code for a new link."
+  step "Finishing the sign-in at Microsoft"
+  rc=0; out=$("$bun" "$EMAIL_PLUGIN_ROOT/msauth.ts" redeem "$pend" <<<"$code") || rc=$?
+  if (( rc != 0 )); then
+    # A wrong paste is fixed with the same link; anything Microsoft refused needs a new one.
+    if [[ "$(jq -r '.error // empty' <<<"$out" 2>/dev/null)" == no_code ]]; then
+      fail "$E_VALIDATION" "$(jq -r .message <<<"$out"). The same link still works: $again"
+    fi
+    rm -f "$pend"
+    fail "$E_AUTH_REQUIRED" "$(jq -r '.message // "the sign-in did not finish"' <<<"$out" 2>/dev/null || echo "the sign-in did not finish"). Run the same connect without --code for a new link."
+  fi
+  rm -f "$pend"
+  (umask 077; printf '%s\n' "$out" >"$pend.done")
+}
+
+# The device-code sign-in (--device-code): a code typed at microsoft.com/devicelogin,
+# for a firm whose policies allow it. Leaves Microsoft's answer in "$pend.done", or exits.
+_ms_device() {  # <agent> <address> <login> <tenant> <client> <wait> <pend>
+  local agent="$1" address="$2" login="$3" tenant="$4" client="$5" wait="$6" pend="$7" bun out rc; bun=$(_bun)
   if [[ ! -r "$pend" ]]; then
     step "Asking Microsoft for a sign-in code (tenant $tenant)"
     rc=0; out=$("$bun" "$EMAIL_PLUGIN_ROOT/msauth.ts" start "$tenant" "$client" "$address") || rc=$?
@@ -288,7 +330,7 @@ To connect $address, the person who signs in to that mailbox (or your IT):
 
   1. opens  $(jq -r .link <<<"$out")
   2. types  $(jq -r .user_code <<<"$out")
-  3. signs in as $address and accepts.
+  3. signs in as $login and accepts.
 
 No password comes to this server. The code works for $(( ($(jq -r .expires_at <<<"$out") - $(_now_ms)) / 60000 )) minutes.
 MSG
@@ -302,11 +344,38 @@ MSG
   step "Waiting for the sign-in at Microsoft (up to $secs s)"
   rc=0; out=$("$bun" "$EMAIL_PLUGIN_ROOT/msauth.ts" poll "$pend" "$secs") || rc=$?
   if (( rc == 75 )); then
-    echo "Not signed in yet: open $(jq -r .link <<<"$out"), type $(jq -r .user_code <<<"$out"), sign in as $address. Then run the same connect again." >&2
+    echo "Not signed in yet: open $(jq -r .link <<<"$out"), type $(jq -r .user_code <<<"$out"), sign in as $login. Then run the same connect again." >&2
     exit "$E_AUTH_REQUIRED"
   fi
   rm -f "$pend"
   (( rc == 0 )) || fail "$E_AUTH_REQUIRED" "$(jq -r '.message // "the sign-in did not finish"' <<<"$out" 2>/dev/null || echo "the sign-in did not finish"). Run the same connect again for a new code."
+  (umask 077; printf '%s\n' "$out" >"$pend.done")
+}
+
+_connect_microsoft() {  # <agent> <name> <info> <address> <login> <tenant> <client> <wait> <ih> <ip> <is> <sh> <sp> <ss> <code> <device>
+  local agent="$1" name="$2" info="$3" address="$4" login="$5" tenant="$6" client="$7" wait="$8"
+  local ih="$9" ip="${10}" is="${11}" sh="${12}" sp="${13}" ss="${14}" code="${15}" dev="${16}"
+  local pend bun out cfg; pend=$(_ms_pending "$agent"); bun=$(_bun); cfg=$(_cfg "$agent")
+  [[ -x "$bun" ]] || fail "$E_VALIDATION" "bun is not on this server (the email channel runs on it): sudo 5dive self-update"
+  # Signing in again later: the firm's app ids are already in the config.
+  [[ -n "$client" ]] || client=$(jq -r '.oauth.client_id // empty' "$cfg" 2>/dev/null || true)
+  [[ -n "$tenant" ]] || tenant=$(jq -r '.oauth.tenant // empty' "$cfg" 2>/dev/null || true)
+  [[ -n "$tenant" ]] || tenant="${address#*@}"
+  [[ -n "$client" ]] || fail "$E_USAGE" "a Microsoft 365 mailbox signs in through your firm's own Microsoft app. Your IT creates it once (5 minutes, docs/IT-GUIDE.md in the email plugin) and gives you its Application (client) ID: --client-id=<id>"
+  [[ "$client" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]] || fail "$E_VALIDATION" "--client-id is the app's Application (client) ID, like 1b2c3d4e-0000-4000-8000-123456789abc"
+  [[ "$tenant" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]] || _domain_ok "$tenant" || fail "$E_VALIDATION" "--tenant is your firm's Directory (tenant) ID or its domain"
+
+  # A waiting sign-in of the other kind, for another mailbox or app, or a run-out one, is stale: start over.
+  local kind=link; (( dev )) && kind=device
+  if [[ -r "$pend" ]] && ! jq -e --arg k "$kind" --arg t "$tenant" --arg c "$client" --arg a "$address" --argjson now "$(_now_ms)" \
+      '(.kind // "device") == $k and .tenant == $t and .client_id == $c and .address == $a and .expires_at > $now' "$pend" >/dev/null 2>&1; then
+    rm -f "$pend"
+  fi
+  rm -f "$pend.done"
+  if (( dev )); then _ms_device "$agent" "$address" "$login" "$tenant" "$client" "$wait" "$pend"
+  else _ms_link "$agent" "$address" "$login" "$tenant" "$client" "$code" "$pend"
+  fi
+  out=$(cat "$pend.done"); rm -f "$pend.done"
   # The agent must read ITS mailbox, not the mailbox of whoever happened to sign in.
   local who; who=$(jq -r '.who // empty' <<<"$out")
   if [[ "$who" != "${login,,}" ]]; then

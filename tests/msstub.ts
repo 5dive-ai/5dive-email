@@ -2,7 +2,7 @@
 // network beyond loopback, no dependencies (node builtins and Bun only).
 //
 //   identity(): Microsoft's sign-in (login.microsoftonline.com/<tenant>/oauth2/v2.0
-//               devicecode + token), device-code and refresh-token grants, with
+//               devicecode + token), device-code, sign-in-link (code + PKCE) and refresh-token grants, with
 //               refresh-token rotation as Microsoft does it (the old one dies).
 //   imap():     Exchange Online's IMAP, the part the channel uses: AUTHENTICATE
 //               XOAUTH2 (SASL-IR) with a token the identity stand-in issued,
@@ -26,6 +26,11 @@ export type Ctl = {
   dead: boolean
   /** devicecode answers this error (e.g. unauthorized_client with AADSTS7000218). */
   start_error?: string
+  /** The sign-in link (DIVE-8407): the one code Microsoft put in the page address, and the PKCE challenge from that link. */
+  code?: string
+  challenge?: string
+  /** The code grant answers this error (e.g. invalid_grant: used or expired). */
+  code_error?: string
 }
 
 const b64u = (o: unknown) => Buffer.from(JSON.stringify(o)).toString('base64url')
@@ -73,6 +78,15 @@ export function identity(port = 0) {
         // Read live, so a test can let the person finish signing in at any point.
         if (++d.polls <= ctl.pending) return err('authorization_pending')
         devices.delete(fields.device_code)
+        return Response.json(issue(true))
+      }
+      if (fields.grant_type === 'authorization_code') {
+        if (ctl.code_error) return err(ctl.code_error, 'AADSTS70008: The provided authorization code or refresh token has expired.')
+        if (fields.redirect_uri !== 'https://login.microsoftonline.com/common/oauth2/nativeclient') return err('invalid_request', 'AADSTS50011: The redirect URI does not match.')
+        if (!ctl.code || fields.code !== ctl.code) return err('invalid_grant', 'AADSTS9002313: Invalid request. Request is malformed or invalid.')
+        const sum = new Bun.CryptoHasher('sha256').update(fields.code_verifier ?? '').digest('base64url')
+        if (!ctl.challenge || sum !== ctl.challenge) return err('invalid_grant', 'AADSTS501481: The Code_Verifier does not match the code_challenge supplied in the authorization request.')
+        ctl.code = undefined // a code works once
         return Response.json(issue(true))
       }
       if (fields.grant_type === 'refresh_token') {
