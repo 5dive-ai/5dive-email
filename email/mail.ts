@@ -590,7 +590,10 @@ export type SpamVerdict = { spam: boolean; score: number | null; phishing: strin
 export function rspamdVerdict(j: any): SpamVerdict {
   const action = String(j?.action ?? 'no action')
   const symbols = j?.symbols && typeof j.symbols === 'object' ? Object.keys(j.symbols) : []
-  const phishing = symbols.filter(s => /PHISH|SPOOF|FREEMAIL_REPLYTO_NEQ|HTML_SHORT_LINK|REDIRECTOR|OMOGRAPH|URIBL|DBL|SURBL|SUSPICIOUS/.test(s)).slice(0, 5)
+  // DIVE-8464: a *_BLOCKED* symbol (DBL_BLOCKED_OPENRESOLVER, URIBL_BLOCKED, …) means
+  // the blocklist REFUSED the lookup (the box asks a public DNS resolver), not that
+  // the sender is listed. Counting it flagged every mail on such a box as phishing.
+  const phishing = symbols.filter(s => !/BLOCKED/.test(s) && /PHISH|SPOOF|FREEMAIL_REPLYTO_NEQ|HTML_SHORT_LINK|REDIRECTOR|OMOGRAPH|URIBL|DBL|SURBL|SUSPICIOUS/.test(s)).slice(0, 5)
   return { spam: /^(reject|add header|rewrite subject)$/.test(action), score: Number.isFinite(Number(j?.score)) ? Number(j.score) : null, phishing, by: 'rspamd' }
 }
 /** No filter running: only the industry's test string is caught (the honest floor, not a spam filter). */

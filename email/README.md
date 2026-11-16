@@ -25,6 +25,13 @@ Two ways to give an agent an address:
    records for IT), then `sudo 5dive email connect mike --self-hosted`.
    Works with the internet off for mail inside the office.
 
+Works on every setup: an agent on a Claude plan; Claude Code on your firm's own
+AI server (Claude Code switches its chat channels off there, so each mail is
+typed into the agent's session instead); and Codex on a ChatGPT account (the
+5dive dispatcher hands each mail to the agent and emails its answer back). The
+doors and checks below are the same on all three. On Codex the agent answers
+mail; starting a brand-new email is Claude Code only for now.
+
 Voicemail: a mail with an audio file (an office phone system's voicemail, a
 recorded memo) reaches the agent with its transcript, heard on this server by
 the local speech-to-text; the audio never leaves it.
@@ -81,7 +88,7 @@ The doors, on by default:
 Check it: `5dive email status mike`. The DNS and network steps for IT:
 [docs/IT-GUIDE.md](docs/IT-GUIDE.md).
 
-Tests (CI runs them all): `bun test tests/email.test.ts` (no dependencies),
+Tests (CI runs them all): `bun test tests/email.test.ts` and `bun test tests/dive8464.test.ts` (no dependencies),
 `sudo env PATH="$PATH" bash tests/cli.sh`, and, with `cd email && bun install`,
 `bun e2e.ts` (the whole path on one machine) and `bun e2e-microsoft.ts` (a
 Microsoft 365 mailbox against stand-ins for Microsoft's sign-in, IMAP and SMTP).

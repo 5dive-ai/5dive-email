@@ -183,6 +183,12 @@ export type LifecycleOpts = {
   forceExitMs?: number
   /** Watchdog cadence. */
   watchdogMs?: number
+  /**
+   * DIVE-8464: running as a Codex dispatcher's channel adapter. Its stdin is
+   * /dev/null (the dispatcher spawns it with stdio 'ignore'), so EOF there is
+   * not a parent leaving: only the parent check and the signals stop it.
+   */
+  adapter?: boolean
 }
 
 /**
@@ -192,7 +198,7 @@ export type LifecycleOpts = {
  * Returns the shutdown function so a caller can trigger it from its own paths.
  */
 export function installLifecycle(opts: LifecycleOpts): (reason: string) => void {
-  const { channel, stateDir, cleanup, forceExitMs = 2000, watchdogMs = 5000 } = opts
+  const { channel, stateDir, cleanup, forceExitMs = 2000, watchdogMs = 5000, adapter = false } = opts
   const bootPpid = process.ppid
 
   recordLifecycle(stateDir, 'start', channel, `boot ok (bootPpid=${bootPpid})`)
@@ -213,8 +219,10 @@ export function installLifecycle(opts: LifecycleOpts): (reason: string) => void 
     })()
   }
 
-  process.stdin.on('end', () => shutdown('stdin end'))
-  process.stdin.on('close', () => shutdown('stdin close'))
+  if (!adapter) {
+    process.stdin.on('end', () => shutdown('stdin end'))
+    process.stdin.on('close', () => shutdown('stdin close'))
+  }
   process.on('SIGTERM', () => shutdown('SIGTERM'))
   process.on('SIGINT', () => shutdown('SIGINT'))
   process.on('SIGHUP', () => shutdown('SIGHUP'))
@@ -226,8 +234,8 @@ export function installLifecycle(opts: LifecycleOpts): (reason: string) => void 
       bootPpid,
       currentPpid,
       bootParentAlive: isBootParentAlive(bootPpid),
-      stdinDestroyed: process.stdin.destroyed,
-      stdinReadableEnded: process.stdin.readableEnded,
+      stdinDestroyed: adapter ? false : process.stdin.destroyed,
+      stdinReadableEnded: adapter ? false : process.stdin.readableEnded,
     })
     if (orphaned) shutdown(`orphaned (bootPpid=${bootPpid} ppid=${currentPpid})`)
   }, watchdogMs)
