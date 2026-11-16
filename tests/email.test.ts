@@ -387,6 +387,11 @@ describe('spam, viruses and phishing (DIVE-8405)', () => {
     const ok = rspamdVerdict({ action: 'no action', score: 1.2, symbols: { PHISHING: {}, R_DKIM_ALLOW: {} } })
     expect(ok).toEqual({ spam: false, score: 1.2, phishing: ['PHISHING'], by: 'rspamd' })
   })
+  test('rspamd: a refused blocklist lookup (*_BLOCKED*) is not a phishing sign (DIVE-8464)', () => {
+    const v = rspamdVerdict({ action: 'no action', score: 0, symbols: { DBL_BLOCKED_OPENRESOLVER: {}, URIBL_BLOCKED: {}, RBL_SPAMHAUS_BLOCKED_OPENRESOLVER: {} } })
+    expect(v.phishing).toEqual([])
+    expect(rspamdVerdict({ symbols: { DBL_PHISH: {}, URIBL_BLACK: {}, DBL_BLOCKED: {} } }).phishing).toEqual(['DBL_PHISH', 'URIBL_BLACK'])
+  })
   test('no filter running: only GTUBE is caught, and the header says unchecked', () => {
     expect(builtinSpam(Buffer.from(`x ${GTUBE} y`)).spam).toBe(true)
     expect(builtinSpam(Buffer.from('buy now')).spam).toBe(false)
