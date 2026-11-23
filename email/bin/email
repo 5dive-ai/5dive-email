@@ -16,15 +16,20 @@
 #       A mailbox the FIRM already runs. The password (or app password) arrives
 #       through a one-time link (--task) or `sudo 5dive secret write
 #       EMAIL_PASSWORD --connector=email-<agent>`, never as an argument.
-#   connect <agent> --address=<a> --provider=microsoft --client-id=<app id>
+#   connect <agent> --address=<a> --provider=microsoft [--client-id=<app id>]
 #           [--tenant=<tenant id or domain>] [--login=<user>] [--code=<page address>]
-#           [--device-code [--wait]]
-#       A Microsoft 365 / Outlook mailbox (DIVE-8407), signed in through the
-#       FIRM'S OWN Microsoft app (their IT registers it: docs/IT-GUIDE.md). No
+#           [--device-code [--wait]] [--json]
+#       A Microsoft 365 / Outlook mailbox (DIVE-8407), work or personal. No
 #       password: the first run prints a Microsoft sign-in link; the person who
 #       signs in as the mailbox sends back the address of the empty page it
 #       lands on, and connect --code=<that address> finishes. --device-code
 #       uses a short code instead, which Microsoft's security defaults refuse.
+#       Without --client-id it signs in through 5dive's own Microsoft app
+#       (DIVE-9120: any Microsoft 365 firm or Outlook.com account, nothing for
+#       IT to set up; the token stays on this box and mail never passes 5dive).
+#       --client-id: the FIRM'S OWN app instead (their IT registers it:
+#       docs/IT-GUIDE.md), for firms that allow no outside app, and offline boxes.
+#       --json: the link comes back as {ok,data:{waiting,link,expires_at,address}}.
 #       Rerun with just --provider=microsoft to sign in again later: the app ids are kept.
 #   connect <agent> --self-hosted [--name=<shown name>]
 #       <agent>@<domain> on this box's own mail server (run `server setup` first).
@@ -68,6 +73,13 @@ MAIL_SPOOL="${EMAIL_MAIL_SPOOL:-/var/lib/5dive/mail}"
 MAIL_OPT="${EMAIL_MAIL_OPT:-/opt/5dive/oamail}"
 SYSTEMCTL="${EMAIL_SYSTEMCTL:-systemctl}"
 UNIT="5dive-mail"
+# DIVE-9120: 5dive's own Microsoft app (multi-tenant public client: no secret,
+# work/school AND personal accounts; registered in 5dive.onmicrosoft.com). It
+# only names the app at Microsoft's sign-in; tokens stay on this box. Empty = not
+# built in, and a Microsoft mailbox needs the firm's own --client-id (as before).
+# EMAIL_MS_DEFAULT_APP set to "" turns it off on a box (tests, Enterprise).
+FIVEDIVE_MS_APP="${EMAIL_MS_DEFAULT_APP-}"
+export EMAIL_MS_DEFAULT_APP="$FIVEDIVE_MS_APP"
 
 readonly E_USAGE=2 E_VALIDATION=3 E_NOT_FOUND=4 E_AUTH_REQUIRED=6 E_PERMISSION=10
 
@@ -286,6 +298,11 @@ _ms_link() {  # <agent> <address> <login> <tenant> <client> <code> <pend>
       install -d -m 700 "$CONNECTORS_DIR"
       (umask 077; printf '%s\n' "$out" >"$pend")
     fi
+    # DIVE-9120: the app's email sheet shows the link as a button, so it wants it alone.
+    if [[ "${FIVEDIVE_JSON_MODE:-0}" == 1 ]]; then
+      jq -c '{ok:true, data:{waiting:"microsoft_signin", link, expires_at, address}}' "$pend"
+      exit "$E_AUTH_REQUIRED"
+    fi
     cat <<MSG
 
 To connect $address, the person who signs in to that mailbox (or your IT):
@@ -361,13 +378,18 @@ _connect_microsoft() {  # <agent> <name> <info> <address> <login> <tenant> <clie
   local ih="$9" ip="${10}" is="${11}" sh="${12}" sp="${13}" ss="${14}" code="${15}" dev="${16}"
   local pend bun out cfg; pend=$(_ms_pending "$agent"); bun=$(_bun); cfg=$(_cfg "$agent")
   [[ -x "$bun" ]] || fail "$E_VALIDATION" "bun is not on this server (the email channel runs on it): sudo 5dive self-update"
-  # Signing in again later: the firm's app ids are already in the config.
-  [[ -n "$client" ]] || client=$(jq -r '.oauth.client_id // empty' "$cfg" 2>/dev/null || true)
-  [[ -n "$tenant" ]] || tenant=$(jq -r '.oauth.tenant // empty' "$cfg" 2>/dev/null || true)
-  [[ -n "$tenant" ]] || tenant="${address#*@}"
+  # Signing in again later: the app ids are already in the config.
+  if [[ -z "$client" ]]; then
+    client=$(jq -r '.oauth.client_id // empty' "$cfg" 2>/dev/null || true)
+    [[ -n "$tenant" ]] || tenant=$(jq -r '.oauth.tenant // empty' "$cfg" 2>/dev/null || true)
+  fi
+  # DIVE-9120: no app of the firm's own: 5dive's, which any Microsoft account can
+  # sign in to (work or school through "common", and personal Outlook.com).
+  if [[ -z "$client" && -n "$FIVEDIVE_MS_APP" ]]; then client="$FIVEDIVE_MS_APP"; fi
+  [[ -n "$tenant" ]] || { [[ "$client" == "$FIVEDIVE_MS_APP" ]] && tenant=common || tenant="${address#*@}"; }
   [[ -n "$client" ]] || fail "$E_USAGE" "a Microsoft 365 mailbox signs in through your firm's own Microsoft app. Your IT creates it once (5 minutes, docs/IT-GUIDE.md in the email plugin) and gives you its Application (client) ID: --client-id=<id>"
   [[ "$client" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]] || fail "$E_VALIDATION" "--client-id is the app's Application (client) ID, like 1b2c3d4e-0000-4000-8000-123456789abc"
-  [[ "$tenant" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]] || _domain_ok "$tenant" || fail "$E_VALIDATION" "--tenant is your firm's Directory (tenant) ID or its domain"
+  [[ "$tenant" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ || "$tenant" =~ ^(common|organizations|consumers)$ ]] || _domain_ok "$tenant" || fail "$E_VALIDATION" "--tenant is your firm's Directory (tenant) ID or its domain"
 
   # A waiting sign-in of the other kind, for another mailbox or app, or a run-out one, is stale: start over.
   local kind=link; (( dev )) && kind=device
@@ -386,6 +408,24 @@ _connect_microsoft() {  # <agent> <name> <info> <address> <login> <tenant> <clie
     fail "$E_VALIDATION" "Microsoft signed in ${who:-an account it did not name}, not $login. Nothing is connected: run the same connect again and sign in as $login (if $who IS this mailbox's sign-in name, add --login=$who)."
   fi
 
+  # DIVE-9120: a personal account (Outlook.com, Hotmail) sends through Outlook.com's server.
+  local consumer; consumer=$(jq -r '.consumer // false' <<<"$out")
+  [[ "$consumer" == true && "$sh" == smtp.office365.com ]] && sh=smtp-mail.outlook.com
+  # DIVE-9120: Microsoft takes the sign-in even with IMAP or Authenticated SMTP turned
+  # off for the mailbox; log in to each once with the new token (nothing is sent).
+  if [[ "${EMAIL_MS_CHECK:-1}" != 0 ]]; then
+    step "Checking that $address can read and send mail with this sign-in"
+    local chk rc=0
+    chk=$(jq -c --arg u "$login" --arg ih "$ih" --argjson ip "$ip" --argjson is "$is" --arg sh "$sh" --argjson sp "$sp" --argjson ss "$ss" \
+      '{access_token, user:$u, consumer:(.consumer // false), imap:{host:$ih, port:$ip, secure:$is}, smtp:{host:$sh, port:$sp, secure:$ss}}' <<<"$out" \
+      | "$bun" "$EMAIL_PLUGIN_ROOT/msauth.ts" check) || rc=$?
+    if (( rc == 1 )); then
+      out=""
+      fail "$E_AUTH_REQUIRED" "$(jq -r '.message // "the mailbox refused mail access"' <<<"$chk" 2>/dev/null || echo "the mailbox refused mail access"). Nothing is connected."
+    fi
+    (( rc == 0 )) || echo "warning: $(jq -r '.message // "the mail check did not answer"' <<<"$chk" 2>/dev/null || echo "the mail check did not answer"); connecting anyway." >&2
+  fi
+
   step "Writing $agent's email settings ($address, Microsoft sign-in)"
   local keep; keep=$(jq -c '{approve_new, approve_inbound, allowed, daily_cap, free_domains, check_sender, trusted_authserv_id, exchange} | with_entries(select(.value != null))' "$cfg" 2>/dev/null || echo '{}')
   _install_cfg "$agent" "$(jq -n --arg a "$address" --arg n "$name" --arg ih "$ih" --argjson ip "$ip" --argjson is "$is" \
@@ -400,13 +440,18 @@ _connect_microsoft() {  # <agent> <name> <info> <address> <login> <tenant> <clie
   rm -f "$(_connector "$agent")"
   _channel_on "$agent" "$info"
   email_audit connect "$agent" "--address=$address" --provider=microsoft "--tenant=$tenant" "--client-id=$client"
+  local via="signed in through your firm's own app" end="Your IT can end this access any time in Microsoft Entra (remove the app, or sign the mailbox out everywhere)."
+  if [[ "$client" == "$FIVEDIVE_MS_APP" ]]; then
+    via="signed in through 5dive's Microsoft app; the mail goes only between this server and Microsoft"
+    end="End this access any time: $( [[ "$consumer" == true ]] && echo "account.microsoft.com > Privacy > Apps and services" || echo "myapps.microsoft.com > the app > Revoke, or your IT in Microsoft Entra" )."
+  fi
   cat <<MSG
 
-$name now reads and answers $address (Microsoft 365, signed in through your firm's own app).
+$name now reads and answers $address ($( [[ "$consumer" == true ]] && echo Outlook.com || echo "Microsoft 365" ), $via).
 
   Mail to $address reaches $name as a chat; $name answers in the same thread.
   A first mail to a new outside address waits for your tap (turn off: sudo 5dive email gate $agent off).
-  Your IT can end this access any time in Microsoft Entra (remove the app, or sign the mailbox out everywhere).
+  $end
   Check it: 5dive email status $agent
 MSG
 }
@@ -487,13 +532,14 @@ email_status() {
     jq -n --arg a "$agent" --argjson c "$connected" --arg ad "$address" --arg m "$mode" --arg g "$gate" --arg d "$door" --arg cap "$cap" \
       --arg ch "$chans" --arg last "$last" --argjson h "$held" --argjson hi "$held_in" --argjson s "$sent" --argjson al "$allowed" \
       --arg sc "$sender" --arg sp "$spam" --arg vi "$virus" --arg sv "$server" --arg si "$signin" \
-      '{ok:true, data:{agent:$a, connected:$c, address:$ad, mode:$m, signin:$si, gate:$g, inbound_gate:$d, sender_check:$sc, sender_server:$sv, spam_filter:$sp, virus_scan:$vi, daily_cap:($cap|tonumber? // 50), sent_today:$s, held:$h, held_inbound:$hi, channels:$ch, last_message:$last, allowed:$al}}'
+      --argjson msa "$([[ -n "$FIVEDIVE_MS_APP" ]] && echo true || echo false)" \
+      '{ok:true, data:{agent:$a, microsoft_app:$msa, connected:$c, address:$ad, mode:$m, signin:$si, gate:$g, inbound_gate:$d, sender_check:$sc, sender_server:$sv, spam_filter:$sp, virus_scan:$vi, daily_cap:($cap|tonumber? // 50), sent_today:$s, held:$h, held_inbound:$hi, channels:$ch, last_message:$last, allowed:$al}}'
     return 0
   fi
   echo "agent:      $agent"
   echo "connected:  $connected"
   [[ "$connected" == true ]] || { echo "next:       sudo 5dive email connect $agent --address=<a> --provider=microsoft|google|other   (or --self-hosted)"; return 0; }
-  echo "address:    $address ($([[ "$mode" == local ]] && echo "this box's own mail server" || { [[ "$signin" == microsoft ]] && echo "the firm's Microsoft 365 mailbox, signed in through the firm's own app" || echo "the firm's mailbox"; }))"
+  echo "address:    $address ($([[ "$mode" == local ]] && echo "this box's own mail server" || { [[ "$signin" == microsoft ]] && { [[ -n "$FIVEDIVE_MS_APP" && "$(jq -r '.oauth.client_id // empty' "$cfg")" == "$FIVEDIVE_MS_APP" ]] && echo "a Microsoft mailbox, signed in through 5dive's Microsoft app" || echo "the firm's Microsoft 365 mailbox, signed in through the firm's own app"; } || echo "the firm's mailbox"; }))"
   echo "channel on: $([[ ",$chans," == *",email,"* ]] && echo yes || echo "no (channels=$chans)")"
   echo "writing to: $([[ "$gate" == on ]] && echo "a first mail to a new outside address waits for your tap" || echo "mails anyone (gate off)")"
   echo "mail from:  $([[ "$door" == on ]] && echo "a first mail from someone unknown waits for your tap, unseen by $agent" || echo "anyone reaches $agent (inbound gate off)")"
@@ -924,10 +970,10 @@ _email_main() {
                                  [--imap-host=<h> --smtp-host=<h>] [--task=<DIVE-N>]
                                  [--trusted-authserv-id=<name>] [--exchange]
                                  a mailbox your firm already runs
-  sudo 5dive email connect <agent> --address=<a> --provider=microsoft --client-id=<app id> [--tenant=<t>]
-                                 a Microsoft 365 / Outlook mailbox: a Microsoft sign-in link, no password;
+  sudo 5dive email connect <agent> --address=<a> --provider=microsoft [--client-id=<app id> --tenant=<t>]
+                                 a Microsoft 365 or Outlook.com mailbox: a Microsoft sign-in link, no password;
                                  finish with --code='<the address of the page it lands on>'
-                                 (your IT creates the app once: docs/IT-GUIDE.md)
+                                 (--client-id: your firm's own app instead of 5dive's: docs/IT-GUIDE.md)
   sudo 5dive email connect <agent> --self-hosted
                                  <agent>@<domain> on this box's own mail server
   5dive email status <agent>

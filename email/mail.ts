@@ -57,7 +57,8 @@ const GUID_RX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
 const DOMAIN_RX = /^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$/i
 export const clientIdOk = (s: unknown): s is string => typeof s === 'string' && GUID_RX.test(s)
 /** A tenant is its id (a GUID) or any domain verified in it (yourfirm.com, yourfirm.onmicrosoft.com). Never "common": the app is the firm's. */
-export const tenantOk = (s: unknown): s is string => typeof s === 'string' && (GUID_RX.test(s) || DOMAIN_RX.test(s))
+// DIVE-9120: 5dive's own app signs in at Microsoft's shared 'common' authority (any firm, or a personal account).
+export const tenantOk = (s: unknown): s is string => typeof s === 'string' && (GUID_RX.test(s) || DOMAIN_RX.test(s) || /^(common|organizations|consumers)$/.test(s))
 
 export type OAuth = { provider: 'microsoft'; tenant: string; client_id: string; refresh_token: string }
 

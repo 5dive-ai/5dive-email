@@ -31,6 +31,11 @@ export type Ctl = {
   challenge?: string
   /** The code grant answers this error (e.g. invalid_grant: used or expired). */
   code_error?: string
+  /** DIVE-9120: the id_token's tenant (the personal-account tenant = an Outlook.com mailbox). */
+  tid?: string
+  /** DIVE-9120: the mailbox has IMAP / Authenticated SMTP turned off (run-alone mail stand-ins). */
+  imap_off?: boolean
+  smtp_off?: boolean
 }
 
 const b64u = (o: unknown) => Buffer.from(JSON.stringify(o)).toString('base64url')
@@ -50,7 +55,7 @@ export function identity(port = 0) {
     return {
       token_type: 'Bearer', access_token: at, refresh_token: rt, expires_in: ctl.expires_in,
       scope: 'https://outlook.office.com/IMAP.AccessAsUser.All https://outlook.office.com/SMTP.Send',
-      ...(withId ? { id_token: `${b64u({ alg: 'none' })}.${b64u({ preferred_username: ctl.who, tid: 't' })}.` } : {}),
+      ...(withId ? { id_token: `${b64u({ alg: 'none' })}.${b64u({ preferred_username: ctl.who, tid: ctl.tid || 't' })}.` } : {}),
     }
   }
   const err = (error: string, d = '') => Response.json({ error, error_description: d }, { status: 400 })
@@ -194,7 +199,38 @@ export function imap(ok: (user: string, token: string) => boolean) {
   }
 }
 
+/** DIVE-9120: Exchange Online's SMTP submission, just EHLO + AUTH XOAUTH2 + QUIT (plain TCP). */
+export function smtp(ok: (user: string, token: string) => boolean, off: () => boolean) {
+  const server = createServer(sock => {
+    let buf = ''
+    const w = (t: string) => { if (!sock.destroyed) sock.write(t) }
+    sock.on('error', () => {})
+    w('220 Microsoft ESMTP stand-in ready\r\n')
+    sock.on('data', d => {
+      buf += d.toString('latin1')
+      let i: number
+      while ((i = buf.indexOf('\r\n')) >= 0) {
+        const line = buf.slice(0, i); buf = buf.slice(i + 2)
+        const [cmd, mech, ir] = line.split(' ')
+        const c = (cmd || '').toUpperCase()
+        if (c === 'EHLO') w('250-stand-in Hello\r\n250-SIZE 157286400\r\n250 AUTH LOGIN XOAUTH2\r\n')
+        else if (c === 'AUTH' && (mech || '').toUpperCase() === 'XOAUTH2') {
+          const s = Buffer.from(ir || '', 'base64').toString()
+          const good = ok(s.match(/user=([^\x01]*)/)?.[1] ?? '', s.match(/auth=Bearer ([^\x01]*)/)?.[1] ?? '')
+          if (off()) w('535 5.7.139 Authentication unsuccessful, SmtpClientAuthentication is disabled for the Tenant.\r\n')
+          else w(good ? '235 2.7.0 Authentication successful\r\n' : '535 5.7.3 Authentication unsuccessful\r\n')
+        } else if (c === 'QUIT') { w('221 2.0.0 Service closing\r\n'); sock.end() }
+        else w('502 5.3.3 Command not implemented\r\n')
+      }
+    })
+  })
+  return { server, listen: () => new Promise<number>(r => server.listen(0, '127.0.0.1', () => r((server.address() as any).port))) }
+}
+
 if (import.meta.main) {
+  // One line: the identity URL, then (DIVE-9120) the IMAP and SMTP stand-ins' ports.
   const id = identity(Number(process.argv[2]) || 0)
-  console.log(id.url)
+  const im = imap((_u, t) => id.valid(t) && !id.ctl.imap_off)
+  const sm = smtp((_u, t) => id.valid(t), () => !!id.ctl.smtp_off)
+  console.log(`${id.url} ${await im.listen()} ${await sm.listen()}`)
 }

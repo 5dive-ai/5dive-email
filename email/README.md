@@ -7,14 +7,19 @@ Two ways to give an agent an address:
 
 1. **A mailbox your firm already runs**: Microsoft 365 / Outlook, Google
    Workspace, or any IMAP + SMTP server. IT makes `mike@yourfirm.com`, then:
-   - **Microsoft 365 / Outlook:**
-     `sudo 5dive email connect mike --address=mike@yourfirm.com --provider=microsoft --client-id=<app id>`
+   - **Microsoft 365 / Outlook (work, school or personal Outlook.com):**
+     `sudo 5dive email connect mike --address=mike@yourfirm.com --provider=microsoft`
      prints a Microsoft sign-in link. Whoever signs in to that mailbox opens it,
      signs in, and sends back the address of the empty page Microsoft shows;
-     finish with the same command and `--code='<that address>'`.
-     The sign-in goes through an app your own IT creates once, in your own
-     Microsoft account ([docs/IT-GUIDE.md](docs/IT-GUIDE.md)), so no password
-     reaches the server and no 5dive account is involved. One app serves
+     finish with the same command and `--code='<that address>'`. The 5dive app's
+     email sheet does the same with one button.
+     The sign-in names 5dive's Microsoft app; the token stays on this server and
+     mail goes only between this server and Microsoft. Connect then logs in to
+     IMAP and SMTP once and says in plain words if the firm's admin must approve
+     the app or turn IMAP / Authenticated SMTP on for the mailbox.
+     A firm that allows no outside app (or an offline box) uses its own app
+     instead: `--client-id=<app id>`, which your IT creates once in your own
+     Microsoft account ([docs/IT-GUIDE.md](docs/IT-GUIDE.md)). One app serves
      every agent's mailbox.
    - **Google Workspace or another server:**
      `sudo 5dive email connect mike --address=mike@yourfirm.com --provider=google --task=<DIVE-N>`

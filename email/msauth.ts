@@ -26,6 +26,8 @@ export const SCOPE = 'https://outlook.office.com/IMAP.AccessAsUser.All https://o
 /** login.microsoftonline.com, or a stand-in in tests. */
 import { clientIdOk, tenantOk, type OAuth } from './mail.ts'
 import { createHash, randomBytes } from 'node:crypto'
+import { connect as netConnect, type Socket } from 'node:net'
+import { connect as tlsConnect } from 'node:tls'
 export { clientIdOk, tenantOk, oauthOk, type OAuth } from './mail.ts'
 
 export const authority = () => (process.env.EMAIL_MS_AUTHORITY || 'https://login.microsoftonline.com').replace(/\/+$/, '')
@@ -54,23 +56,32 @@ async function post(tenant: string, path: string, fields: Record<string, string>
   return { body }
 }
 
-/** The address Microsoft signed in, read from the id_token (shown, compared; never used for access). */
-export function signedInAs(idToken: unknown): string {
+function claimsOf(idToken: unknown): any {
   try {
-    const part = String(idToken).split('.')[1]
-    const claims = JSON.parse(Buffer.from(part, 'base64url').toString('utf8'))
-    return String(claims.preferred_username || claims.email || claims.upn || '').toLowerCase()
+    return JSON.parse(Buffer.from(String(idToken).split('.')[1], 'base64url').toString('utf8')) ?? {}
   } catch {
-    return ''
+    return {}
   }
 }
+
+/** The address Microsoft signed in, read from the id_token (shown, compared; never used for access). */
+export function signedInAs(idToken: unknown): string {
+  const c = claimsOf(idToken)
+  return String(c.preferred_username || c.email || c.upn || '').toLowerCase()
+}
+
+// DIVE-9120: the tenant id Microsoft gives every personal account (Outlook.com,
+// Hotmail, Live). Such a mailbox sends through smtp-mail.outlook.com, not
+// smtp.office365.com, and has no firm admin to ask.
+export const CONSUMER_TENANT = '9188040d-6c67-4c5b-b112-36a304b66dad'
+export const isConsumer = (idToken: unknown): boolean => String(claimsOf(idToken).tid || '').toLowerCase() === CONSUMER_TENANT
 
 export type Pending = { tenant: string; client_id: string; address: string; device_code: string; user_code: string; link: string; interval: number; expires_at: number }
 
 /** Step 1: Microsoft's code for a person to type at the link. */
 export async function deviceStart(tenant: string, clientId: string, address: string): Promise<Pending> {
   const { body, err } = await post(tenant, 'devicecode', { client_id: clientId, scope: SCOPE })
-  if (err) throw explain(err, body)
+  if (err) throw explain(err, body, clientId)
   return {
     tenant, client_id: clientId, address,
     device_code: String(body.device_code), user_code: String(body.user_code),
@@ -80,7 +91,7 @@ export async function deviceStart(tenant: string, clientId: string, address: str
   }
 }
 
-export type Done = { refresh_token: string; access_token: string; expires_at: number; who: string }
+export type Done = { refresh_token: string; access_token: string; expires_at: number; who: string; consumer: boolean }
 
 // ── The sign-in link (DIVE-8407, the default) ────────────────────────────────
 // Microsoft's security defaults, on in most small tenants, refuse the device
@@ -120,15 +131,15 @@ export function readPasted(pasted: string): { code?: string; state?: string; err
 export async function linkRedeem(p: LinkPending, pasted: string): Promise<Done> {
   if (p.expires_at <= Date.now()) throw new SignInError('expired_token', 'the sign-in link expired before it was finished', true)
   const r = readPasted(pasted)
-  if (r.error) throw explain(r.error, { error_description: r.error_description })
+  if (r.error) throw explain(r.error, { error_description: r.error_description }, p.client_id)
   if (!r.code) throw new SignInError('no_code', "that is not the address of the page Microsoft showed after the sign-in (it starts with https://login.microsoftonline.com/common/oauth2/nativeclient?code=)", true)
   if (r.state !== undefined && r.state !== p.state) throw new SignInError('wrong_state', 'that address belongs to a different sign-in link than the one this server is waiting for', true)
   const { body, err } = await post(p.tenant, 'token', {
     client_id: p.client_id, grant_type: 'authorization_code', code: r.code, redirect_uri: REDIRECT, code_verifier: p.verifier, scope: SCOPE,
   })
-  if (err) throw explain(err, body)
+  if (err) throw explain(err, body, p.client_id)
   if (!body.refresh_token) throw new SignInError('no_refresh_token', 'Microsoft gave no lasting sign-in (the app is missing offline_access). Your IT adds it: docs/IT-GUIDE.md', true)
-  return { refresh_token: body.refresh_token, access_token: body.access_token, expires_at: Date.now() + (Number(body.expires_in) || 3600) * 1000, who: signedInAs(body.id_token) }
+  return { refresh_token: body.refresh_token, access_token: body.access_token, expires_at: Date.now() + (Number(body.expires_in) || 3600) * 1000, who: signedInAs(body.id_token), consumer: isConsumer(body.id_token) }
 }
 
 /** Step 2: wait up to `waitMs` for the person to finish. undefined = not yet. */
@@ -141,10 +152,10 @@ export async function devicePoll(p: Pending, waitMs: number, sleep = (ms: number
     })
     if (!err) {
       if (!body.refresh_token) throw new SignInError('no_refresh_token', 'Microsoft gave no lasting sign-in (the app is missing offline_access). Your IT adds it: docs/IT-GUIDE.md', true)
-      return { refresh_token: body.refresh_token, access_token: body.access_token, expires_at: Date.now() + (Number(body.expires_in) || 3600) * 1000, who: signedInAs(body.id_token) }
+      return { refresh_token: body.refresh_token, access_token: body.access_token, expires_at: Date.now() + (Number(body.expires_in) || 3600) * 1000, who: signedInAs(body.id_token), consumer: isConsumer(body.id_token) }
     }
     if (err === 'slow_down') interval += 5000
-    else if (err !== 'authorization_pending') throw explain(err, body)
+    else if (err !== 'authorization_pending') throw explain(err, body, p.client_id)
     if (Date.now() + interval > deadline) {
       if (Date.now() + interval > p.expires_at) throw new SignInError('expired_token', 'the code expired before the sign-in was finished', true)
       return undefined
@@ -153,8 +164,26 @@ export async function devicePoll(p: Pending, waitMs: number, sleep = (ms: number
   }
 }
 
-function explain(err: string, body: any): SignInError {
-  const d = String(body?.error_description || '').split('\n')[0].slice(0, 300)
+// DIVE-9120: 5dive's own Microsoft app (bin/email passes its id), for firms with
+// no IT to register one. Its fixes are worded for the owner, not for an IT team.
+export const fivediveApp = () => (process.env.EMAIL_MS_DEFAULT_APP || '').toLowerCase()
+
+/** The link a firm's Microsoft admin opens once to let 5dive's app read and send mail for everyone. */
+export function adminConsentLink(clientId: string): string {
+  const q = new URLSearchParams({ client_id: clientId, scope: SCOPE.split(' ').filter(s => s.startsWith('https://')).join(' '), redirect_uri: REDIRECT })
+  return `https://login.microsoftonline.com/organizations/v2.0/adminconsent?${q}`
+}
+
+export function explain(err: string, body: any, clientId = ''): SignInError {
+  const d = String(body?.error_description || '').replace(/\+/g, ' ').split('\n')[0].slice(0, 300)
+  const ours = !!clientId && clientId.toLowerCase() === fivediveApp()
+  // AADSTS65001 / 90094 / 90095 / 90008: only the firm's Microsoft admin can let this app in.
+  // Checked before the error name: Microsoft sends these as access_denied or consent_required.
+  if (/AADSTS(65001|90094|90095|90008)\b/.test(d) || (ours && err === 'consent_required')) {
+    return new SignInError('admin_consent', ours
+      ? `your firm lets in only apps its Microsoft admin has approved. Send your admin this link to approve 5dive's mail sign-in once, then connect again: ${adminConsentLink(clientId)}`
+      : "the firm's app is missing your IT's consent for mail (docs/IT-GUIDE.md)", true)
+  }
   const say: Record<string, string> = {
     authorization_declined: 'the sign-in was declined at Microsoft',
     access_denied: 'the sign-in was declined at Microsoft',
@@ -186,7 +215,7 @@ export function tokenSource(o: OAuth, keep: (refreshToken: string) => void) {
     const { body, err } = await post(o.tenant, 'token', {
       client_id: o.client_id, grant_type: 'refresh_token', refresh_token: o.refresh_token, scope: SCOPE,
     })
-    if (err) throw explain(err, body)
+    if (err) throw explain(err, body, o.client_id)
     if (body.refresh_token && body.refresh_token !== o.refresh_token) {
       o.refresh_token = body.refresh_token
       keep(body.refresh_token)
@@ -205,8 +234,111 @@ export function tokenSource(o: OAuth, keep: (refreshToken: string) => void) {
   }
 }
 
+
+// ── DIVE-9120: does the mailbox let mail in and out with this sign-in? ────────
+// Microsoft takes the sign-in even when IMAP or Authenticated SMTP is turned
+// off for the mailbox (or, under security defaults, for the whole firm), and the
+// agent would then sit connected and deaf. So connect logs in once to each with
+// the new token, sends nothing, and says in plain words which switch is off.
+export type Box = { host: string; port: number; secure: boolean }
+export type CheckIn = { access_token: string; user: string; consumer?: boolean; imap: Box; smtp: Box }
+export type CheckOut = { ok: true } | { ok: false; error: 'imap_off' | 'smtp_off' | 'unreachable'; message: string }
+
+function reader(sock: Socket) {
+  let buf = '', ended = false, wake: (() => void) | null = null
+  const poke = () => { const w = wake; wake = null; w?.() }
+  sock.on('data', d => { buf += d.toString('latin1'); poke() })
+  sock.on('close', () => { ended = true; poke() })
+  sock.on('error', () => { ended = true; poke() })
+  return async (done: (b: string) => boolean, ms = 15_000): Promise<string> => {
+    const until = Date.now() + ms
+    for (;;) {
+      if (done(buf)) { const b = buf; buf = ''; return b }
+      if (ended) throw new Error('the connection closed')
+      if (Date.now() > until) throw new Error('no answer')
+      await new Promise<void>(r => { wake = r; setTimeout(r, 250) })
+    }
+  }
+}
+// Test stand-ins speak plain TCP (EMAIL_MS_CHECK_PLAIN=1); Microsoft never does.
+const plain = () => process.env.EMAIL_MS_CHECK_PLAIN === '1'
+function open(b: Box): Promise<Socket> {
+  return new Promise((ok, no) => {
+    const s = b.secure && !plain() ? tlsConnect({ host: b.host, port: b.port, servername: b.host }) : netConnect({ host: b.host, port: b.port })
+    s.setTimeout(20_000, () => s.destroy(new Error('no answer')))
+    s.once(b.secure && !plain() ? 'secureConnect' : 'connect', () => ok(s))
+    s.once('error', no)
+  })
+}
+const sasl = (user: string, token: string) => Buffer.from(`user=${user}\x01auth=Bearer ${token}\x01\x01`).toString('base64')
+const lastLine = (b: string) => b.trimEnd().split('\r\n').pop() ?? ''
+const smtpDone = (b: string) => b.endsWith('\r\n') && /^\d{3} /.test(lastLine(b))
+
+/** IMAP: true = logged in, false = refused, throws = could not ask. */
+async function imapLogin(c: CheckIn): Promise<boolean> {
+  const s = await open(c.imap)
+  try {
+    const read = reader(s)
+    await read(b => /^\* (OK|PREAUTH)/m.test(b))
+    s.write(`c1 AUTHENTICATE XOAUTH2 ${sasl(c.user, c.access_token)}\r\n`)
+    let r = await read(b => /^(c1 |\+)/m.test(b) && b.endsWith('\r\n'))
+    if (/^\+/m.test(r)) { s.write('\r\n'); r = await read(b => /^c1 /m.test(b) && b.endsWith('\r\n')) } // the error challenge, answered empty
+    const good = /^c1 OK/m.test(r)
+    if (good) s.write('c2 LOGOUT\r\n')
+    return good
+  } finally { setTimeout(() => s.destroy(), 200) }
+}
+
+/** SMTP: '' = logged in, else the server's refusal line; throws = could not ask. */
+async function smtpLogin(c: CheckIn): Promise<string> {
+  let s = await open(c.smtp)
+  try {
+    let read = reader(s)
+    await read(smtpDone)
+    s.write('EHLO 5dive\r\n'); let r = await read(smtpDone)
+    if (!c.smtp.secure && !plain()) {
+      s.write('STARTTLS\r\n'); r = await read(smtpDone)
+      if (!/^220/.test(lastLine(r))) throw new Error(`no STARTTLS: ${lastLine(r)}`)
+      s.removeAllListeners('data')
+      const raw = s
+      s = await new Promise<Socket>((ok, no) => { const t = tlsConnect({ socket: raw, servername: c.smtp.host }, () => ok(t)); t.once('error', no) })
+      read = reader(s)
+      s.write('EHLO 5dive\r\n'); await read(smtpDone)
+    }
+    s.write(`AUTH XOAUTH2 ${sasl(c.user, c.access_token)}\r\n`); r = await read(smtpDone)
+    if (/^334/.test(lastLine(r))) { s.write('\r\n'); r = await read(smtpDone) }
+    if (/^235/.test(lastLine(r))) { s.write('QUIT\r\n'); return '' }
+    return lastLine(r).slice(0, 200)
+  } finally { const t = s; setTimeout(() => t.destroy(), 200) }
+}
+
+export async function mailCheck(c: CheckIn): Promise<CheckOut> {
+  const where = c.consumer
+    ? 'in Outlook.com: Settings > Mail > Forwarding and IMAP > Let devices and apps use IMAP'
+    : `in the Microsoft 365 admin center: Users > Active users > ${c.user} > Mail > Manage email apps`
+  let step = 'IMAP'
+  try {
+    if (!(await imapLogin(c))) {
+      return { ok: false, error: 'imap_off', message: c.consumer
+        ? `Outlook.com let ${c.user} sign in, but reading mail by IMAP is turned off for it. Turn it on ${where}, then connect again`
+        : `Microsoft let ${c.user} sign in, but IMAP is turned off for this mailbox. Your Microsoft admin ticks IMAP and Authenticated SMTP ${where}, then connect again` }
+    }
+    step = 'SMTP'
+    const no = await smtpLogin(c)
+    if (no) {
+      return { ok: false, error: 'smtp_off', message: c.consumer
+        ? `Outlook.com let ${c.user} read mail, but refused sending (${no}). Check ${where}, then connect again`
+        : `Microsoft let ${c.user} read mail, but sending is turned off for this mailbox (Authenticated SMTP). Your Microsoft admin ticks Authenticated SMTP ${where} (if it is off for the whole firm: Exchange admin center > Settings > Mail flow); it can take 30 minutes to work. Then connect again` }
+    }
+    return { ok: true }
+  } catch (e) {
+    return { ok: false, error: 'unreachable', message: `could not check ${step} at ${step === 'IMAP' ? c.imap.host : c.smtp.host} (${String((e as Error)?.message ?? e).slice(0, 120)})` }
+  }
+}
+
 // ── CLI: `bun msauth.ts link <tenant> <client_id> <address>` / `bun msauth.ts redeem <pending.json>` (pasted address on stdin)
-//        device code: `bun msauth.ts start <tenant> <client_id> <address>` / `bun msauth.ts poll <pending.json> <wait seconds>` ──
+//        device code: `bun msauth.ts start <tenant> <client_id> <address>` / `bun msauth.ts poll <pending.json> <wait seconds>`
+//        mail check: `bun msauth.ts check` (CheckIn JSON on stdin; exit 0 ok, 1 refused, 75 could not ask) ──
 // One JSON line on stdout; exit 0 done/started, 75 still waiting, 1 refused.
 if (import.meta.main) {
   const [verb, ...a] = process.argv.slice(2)
@@ -220,7 +352,7 @@ if (import.meta.main) {
       const p: Pending = JSON.parse(await Bun.file(a[0]).text())
       const d = await devicePoll(p, Math.max(0, Number(a[1]) || 0) * 1000)
       if (!d) { out({ pending: true, user_code: p.user_code, link: p.link, expires_at: p.expires_at }); process.exit(75) }
-      out({ refresh_token: d.refresh_token, who: d.who })
+      out({ refresh_token: d.refresh_token, access_token: d.access_token, who: d.who, consumer: d.consumer })
     } else if (verb === 'link') {
       const [tenant, clientId, address] = a
       if (!tenantOk(tenant) || !clientIdOk(clientId) || !address) throw new SignInError('usage', 'usage: link <tenant> <client_id> <address>', true)
@@ -229,7 +361,11 @@ if (import.meta.main) {
       // The pasted address comes on stdin, never in argv.
       const p: LinkPending = JSON.parse(await Bun.file(a[0]).text())
       const d = await linkRedeem(p, await new Response(Bun.stdin.stream()).text())
-      out({ refresh_token: d.refresh_token, who: d.who })
+      out({ refresh_token: d.refresh_token, access_token: d.access_token, who: d.who, consumer: d.consumer })
+    } else if (verb === 'check') {
+      const r = await mailCheck(JSON.parse(await new Response(Bun.stdin.stream()).text()))
+      out(r)
+      if (!r.ok) process.exit(r.error === 'unreachable' ? 75 : 1)
     } else {
       throw new SignInError('usage', 'usage: msauth.ts start|poll|link|redeem …', true)
     }

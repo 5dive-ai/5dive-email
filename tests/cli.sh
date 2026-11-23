@@ -239,8 +239,13 @@ else
   export EMAIL_BUN="$BUN"
   coproc MSSTUB { exec "$BUN" "$ROOT/tests/msstub.ts" 0; }
   GPIDS+=("$MSSTUB_PID")
-  read -r -t 20 MSURL <&"${MSSTUB[0]}"
+  read -r -t 20 MSURL MSIMAP MSSMTP <&"${MSSTUB[0]}"
   export EMAIL_MS_AUTHORITY="$MSURL"
+  # DIVE-9120: 5dive's own app is built in for every arm below, so the firm's-app arms
+  # (--client-id) prove that path is untouched by it. The mail check needs real
+  # Microsoft, so it is off except in the arms that point it at the stand-ins.
+  FAPP=5d1e0000-9120-4000-8000-0000000000aa
+  export EMAIL_MS_DEFAULT_APP="$FAPP" EMAIL_MS_CHECK=0
   ctl() { curl -fsS -X POST "$MSURL/_ctl" -d "$1" >/dev/null; }
   APP=1b2c3d4e-0000-4000-8000-123456789abc
   PEND="$W/conn/email-max.ms-pending.json"
@@ -351,6 +356,65 @@ else
   rm -f "$PEND"
   run connect max --provider=microsoft --code="https://login.microsoftonline.com/common/oauth2/nativeclient?code=ac-4"
   [[ $RC == 2 && "$OUT" == *"no Microsoft sign-in is waiting"* ]] && ok "MS19 --code with no link waiting: says to make one first" || bad "MS19 no pending" "$RC $OUT"
+
+  echo "  5dive's own Microsoft app (DIVE-9120): no IT setup, work or personal mailboxes"
+  ctl '{"code_error":null,"tid":null,"imap_off":false,"smtp_off":false,"who":"max@example.com"}'
+  rm -f "$CFG" "$PEND"; echo telegram >"$W/channels"
+  OUT=$(FIVEDIVE_JSON_MODE=1 bash "$BIN" status max 2>&1); M1=$(jq -c '.data.microsoft_app' <<<"$OUT")
+  OUT=$(EMAIL_MS_DEFAULT_APP="" FIVEDIVE_JSON_MODE=1 bash "$BIN" status max 2>&1); M0=$(jq -c '.data.microsoft_app' <<<"$OUT")
+  [[ "$M1 $M0" == "true false" ]] && ok "MS21 status --json says whether 5dive's Microsoft app is built in (the app's Outlook chip shows only then)" || bad "MS21 microsoft_app" "$M1 $M0"
+  N0=$(curl -fsS "$MSURL/_log" | jq length)
+  OUT=$(bash "$BIN" connect max --address=$A --provider=microsoft --json 2>/dev/null); RC=$?
+  LINK=$(jq -r '.data.link // empty' <<<"$OUT" 2>/dev/null); Q="${LINK#*\?}"
+  [[ $RC == 6 && "$(jq -r '[.ok,.data.waiting,.data.address,(.data.expires_at > 0)] | @tsv' <<<"$OUT")" == "true	microsoft_signin	$A	true" \
+     && "$LINK" == "$MSURL/common/oauth2/v2.0/authorize?"* && "$(qp client_id)" == "$FAPP" && "$(qp code_challenge_method)" == S256 \
+     && "$(jq -r .link "$PEND")" == "$LINK" && "$(stat -c '%a %U' "$PEND")" == "600 root" && "$OUT" != *"$(jq -r .verifier "$PEND")"* \
+     && ! -e "$CFG" && "$(curl -fsS "$MSURL/_log" | jq length)" == "$N0" ]] \
+    && ok "MS22 no --client-id: 5dive's app at Microsoft's common sign-in (any firm, or Outlook.com); --json gives the link alone for the app; the verifier stays root-only; nothing written" \
+    || bad "MS22 default app link" "$RC $OUT"
+  ST=$(qp state); CH=$(qp code_challenge)
+  ctl "{\"code\":\"ac-21\",\"challenge\":\"$CH\",\"imap_off\":true}"
+  STUBS=(--imap-host=127.0.0.1 "--imap-port=$MSIMAP" --smtp-host=127.0.0.1 "--smtp-port=$MSSMTP")
+  EMAIL_MS_CHECK=1 EMAIL_MS_CHECK_PLAIN=1 run connect max --provider=microsoft "${STUBS[@]}" --code="code=ac-21&state=$ST"
+  [[ $RC == 6 && "$OUT" == *"IMAP is turned off for this mailbox"* && "$OUT" == *"Manage email apps"* && "$OUT" == *"Nothing is connected"* && ! -e "$CFG" && ! -e "$PEND" && ! -e "$PEND.done" ]] \
+    && ok "MS23 IMAP turned off for the mailbox: Microsoft took the sign-in, the check says which switch the admin ticks, nothing written" || bad "MS23 imap off" "$RC $OUT"
+  run connect max --address=$A --provider=microsoft
+  Q=$(jq -r .link "$PEND"); Q="${Q#*\?}"; ST=$(qp state); CH=$(qp code_challenge)
+  ctl "{\"code\":\"ac-22\",\"challenge\":\"$CH\",\"imap_off\":false,\"smtp_off\":true}"
+  EMAIL_MS_CHECK=1 EMAIL_MS_CHECK_PLAIN=1 run connect max --provider=microsoft "${STUBS[@]}" --code="code=ac-22&state=$ST"
+  [[ $RC == 6 && "$OUT" == *"sending is turned off"* && "$OUT" == *"Authenticated SMTP"* && ! -e "$CFG" && ! -e "$PEND" ]] \
+    && ok "MS24 Authenticated SMTP turned off (5.7.139): said in words with where to tick it, nothing written" || bad "MS24 smtp off" "$RC $OUT"
+  run connect max --address=$A --provider=microsoft
+  Q=$(jq -r .link "$PEND"); Q="${Q#*\?}"; ST=$(qp state); CH=$(qp code_challenge)
+  ctl "{\"code\":\"ac-23\",\"challenge\":\"$CH\",\"smtp_off\":false}"
+  EMAIL_MS_CHECK=1 EMAIL_MS_CHECK_PLAIN=1 run connect max --provider=microsoft --name=Max "${STUBS[@]}" --code="code=ac-23&state=$ST"
+  RT=$(jq -r '.oauth.refresh_token // empty' "$CFG" 2>/dev/null)
+  [[ $RC == 0 && "$RT" == rt-* && "$OUT" != *"$RT"* && "$OUT" == *"5dive's Microsoft app"* && "$OUT" == *"Microsoft 365"* \
+     && "$(jq -c '[.oauth.provider,.oauth.tenant,.oauth.client_id,.imap.user,(.oauth|has("access_token"))]' "$CFG")" == "[\"microsoft\",\"common\",\"$FAPP\",\"$A\",false]" \
+     && ! -e "$PEND" && ! -e "$PEND.done" && "$(cat "$W/channels")" == "telegram,email" ]] \
+    && ok "MS25 the app's paste (code=…&state=…), IMAP and SMTP both log in: connected through 5dive's app at common, only the refresh token kept, never printed" \
+    || bad "MS25 default app connect" "$RC $OUT $(jq -c . "$CFG" 2>/dev/null)"
+  run connect max --address=pat@outlook.com --provider=microsoft
+  Q=$(jq -r .link "$PEND"); Q="${Q#*\?}"; ST=$(qp state); CH=$(qp code_challenge)
+  ctl "{\"code\":\"ac-24\",\"challenge\":\"$CH\",\"who\":\"pat@outlook.com\",\"tid\":\"9188040d-6c67-4c5b-b112-36a304b66dad\"}"
+  run connect max --provider=microsoft --code="code=ac-24&state=$ST"
+  [[ $RC == 0 && "$(jq -r '[.address,.smtp.host,.imap.host,.oauth.tenant] | join(" ")' "$CFG")" == "pat@outlook.com smtp-mail.outlook.com outlook.office365.com common" \
+     && "$OUT" == *"Outlook.com"* && "$OUT" == *"account.microsoft.com"* ]] \
+    && ok "MS26 a personal Outlook.com account: sends through smtp-mail.outlook.com, and is told where to end the access itself" || bad "MS26 consumer" "$RC $OUT $(jq -c . "$CFG")"
+  ctl '{"tid":null,"who":"max@example.com"}'
+  run connect max --address=$A --provider=microsoft
+  ST=$(Q=$(jq -r .link "$PEND"); Q="${Q#*\?}"; qp state)
+  run connect max --provider=microsoft --code="error=access_denied&error_description=AADSTS90094%3a+Admin+approval+required.&state=$ST"
+  [[ $RC == 6 && "$OUT" == *"its Microsoft admin has approved"* && "$OUT" == *"/organizations/v2.0/adminconsent?client_id=$FAPP"* && ! -e "$PEND" ]] \
+    && ok "MS27 the firm only lets in admin-approved apps (AADSTS90094): plain words plus the one link the admin opens" || bad "MS27 admin consent" "$RC $OUT"
+  run connect max --address=$A --provider=microsoft --client-id=$APP
+  ST=$(Q=$(jq -r .link "$PEND"); Q="${Q#*\?}"; qp state)
+  run connect max --provider=microsoft --code="error=access_denied&error_description=AADSTS65001%3a+consent+missing&state=$ST"
+  [[ $RC == 6 && "$OUT" == *"missing your IT's consent"* && "$OUT" != *adminconsent* ]] \
+    && ok "MS28 the same refusal on the firm's own app: points at the firm's IT, no 5dive link" || bad "MS28 firm consent" "$RC $OUT"
+  rm -f "$PEND" "$CFG"
+  OUT=$(EMAIL_MS_DEFAULT_APP="" bash "$BIN" connect max --address=$A --provider=microsoft 2>&1); RC=$?
+  [[ $RC == 2 && "$OUT" == *"--client-id=<id>"* && ! -e "$PEND" ]] && ok "MS29 a box with no 5dive app (Enterprise, or before it is registered): asks for the firm's --client-id as before" || bad "MS29 no default" "$RC $OUT"
 fi
 
 echo "$PASS passed, $FAIL failed"

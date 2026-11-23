@@ -1,7 +1,7 @@
 {
   "name": "email",
   "description": "Email channel for Claude Code and Codex: each agent gets its own email address, in your firm's mailbox or on your server's own mail server. Mail arrives as a chat, the agent answers in the same thread, and a first mail to someone new waits for your tap.",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "author": {
     "name": "5dive",
     "email": "support@5dive.com"
