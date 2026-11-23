@@ -407,6 +407,12 @@ else
   run connect max --provider=microsoft --code="error=access_denied&error_description=AADSTS90094%3a+Admin+approval+required.&state=$ST"
   [[ $RC == 6 && "$OUT" == *"its Microsoft admin has approved"* && "$OUT" == *"/organizations/v2.0/adminconsent?client_id=$FAPP"* && ! -e "$PEND" ]] \
     && ok "MS27 the firm only lets in admin-approved apps (AADSTS90094): plain words plus the one link the admin opens" || bad "MS27 admin consent" "$RC $OUT"
+  run connect max --address=$A --provider=microsoft --json
+  ST=$(Q=$(jq -r .data.link "$PEND"); Q="${Q#*\?}"; qp state)
+  OUT=$(bash "$BIN" connect max --provider=microsoft --json --code="code=x&state=other" 2>/dev/null); RC=$?
+  OUT2=$(bash "$BIN" connect max --provider=microsoft --json --code="hello" 2>/dev/null); RC2=$?
+  [[ $RC == 6 && "$(jq -r '[.ok,.error.code,(.error.message|test("different sign-in link"))] | @tsv' <<<"$OUT")" == "false	6	true" && "$RC2" == 2 && "$(jq -r .ok <<<"$OUT2")" == false ]] \
+    && ok "MS27b with --json a refusal is also an {ok:false} envelope on stdout (the app keeps the exit code only then)" || bad "MS27b json refusal" "$RC $OUT | $RC2 $OUT2"
   run connect max --address=$A --provider=microsoft --client-id=$APP
   ST=$(Q=$(jq -r .link "$PEND"); Q="${Q#*\?}"; qp state)
   run connect max --provider=microsoft --code="error=access_denied&error_description=AADSTS65001%3a+consent+missing&state=$ST"
