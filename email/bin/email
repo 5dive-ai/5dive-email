@@ -78,7 +78,7 @@ UNIT="5dive-mail"
 # only names the app at Microsoft's sign-in; tokens stay on this box. Empty = not
 # built in, and a Microsoft mailbox needs the firm's own --client-id (as before).
 # EMAIL_MS_DEFAULT_APP set to "" turns it off on a box (tests, Enterprise).
-FIVEDIVE_MS_APP="${EMAIL_MS_DEFAULT_APP-}"
+FIVEDIVE_MS_APP="${EMAIL_MS_DEFAULT_APP-296f2516-fb76-4b8a-9930-88cdbca529d9}"
 export EMAIL_MS_DEFAULT_APP="$FIVEDIVE_MS_APP"
 
 readonly E_USAGE=2 E_VALIDATION=3 E_NOT_FOUND=4 E_AUTH_REQUIRED=6 E_PERMISSION=10
