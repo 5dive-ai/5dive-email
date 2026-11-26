@@ -418,6 +418,27 @@ else
   run connect max --provider=microsoft --code="error=access_denied&error_description=AADSTS65001%3a+consent+missing&state=$ST"
   [[ $RC == 6 && "$OUT" == *"missing your IT's consent"* && "$OUT" != *adminconsent* ]] \
     && ok "MS28 the same refusal on the firm's own app: points at the firm's IT, no 5dive link" || bad "MS28 firm consent" "$RC $OUT"
+  echo "  DIVE-9314: what the live sign-ins met"
+  rm -f "$CFG" "$PEND"
+  run connect max --address=$A --provider=microsoft
+  ST=$(Q=$(jq -r .link "$PEND"); Q="${Q#*\?}"; qp state)
+  run connect max --provider=microsoft --code="https://login.microsoftonline.com/common/oauth2/nativeclient?error=access_denied&error_subcode=cancel&state=$ST"
+  [[ $RC == 6 && "$OUT" == *"Need admin approval"* && "$OUT" == *"/organizations/v2.0/adminconsent?client_id=$FAPP"* && "$OUT" != *"declined at Microsoft"* && ! -e "$PEND" && ! -e "$CFG" ]] \
+    && ok "MS30 Microsoft's \"Need admin approval\" page sent back (access_denied, subcode cancel, no code): the admin's one link, not \"declined\"" || bad "MS30 admin page" "$RC $OUT"
+  run connect max --address=$A --provider=microsoft
+  Q=$(jq -r .link "$PEND"); Q="${Q#*\?}"; ST=$(qp state); CH=$(qp code_challenge)
+  ctl "{\"code\":\"ac-31\",\"challenge\":\"$CH\",\"imap_off\":false,\"smtp_off\":false,\"imap_not_ready\":true}"
+  EMAIL_MS_CHECK=1 EMAIL_MS_CHECK_PLAIN=1 run connect max --provider=microsoft "${STUBS[@]}" --code="code=ac-31&state=$ST"
+  ctl '{"imap_not_ready":false}'
+  [[ $RC == 6 && "$OUT" == *"still setting up this mailbox"* && "$OUT" != *"turned off"* && "$OUT" == *"Nothing is connected"* && ! -e "$CFG" && ! -e "$PEND" ]] \
+    && ok "MS31 a freshly licensed mailbox (\"authenticated but not connected\"): try again in an hour, not \"IMAP is turned off\"; nothing written" || bad "MS31 not ready" "$RC $OUT"
+  OUT=$(bash "$BIN" connect max --address=$A --provider=microsoft --json 2>/dev/null)
+  Q=$(jq -r .data.link <<<"$OUT"); Q="${Q#*\?}"; ST=$(qp state); CH=$(qp code_challenge)
+  ctl "{\"code\":\"ac-32\",\"challenge\":\"$CH\"}"
+  OUT=$(EMAIL_MS_CHECK=1 EMAIL_MS_CHECK_PLAIN=1 bash "$BIN" connect max --provider=microsoft --name=Max "${STUBS[@]}" --json --code="code=ac-32&state=$ST" 2>/dev/null); RC=$?
+  [[ $RC == 0 && "$(jq -r '[.ok,.data.connected,.data.address,.data.account,.data.app] | @tsv' <<<"$OUT")" == "true	true	$A	microsoft_365	5dive" \
+     && "$(wc -l <<<"$OUT")" == 1 && "$OUT" != *rt-* && "$(jq -r .oauth.refresh_token "$CFG")" == rt-* ]] \
+    && ok "MS32 the finish with --json: one {ok:true} envelope on stdout (connected, which account, which app), no prose, no token" || bad "MS32 json finish" "$RC $OUT"
   rm -f "$PEND" "$CFG"
   OUT=$(EMAIL_MS_DEFAULT_APP="" bash "$BIN" connect max --address=$A --provider=microsoft 2>&1); RC=$?
   [[ $RC == 2 && "$OUT" == *"--client-id=<id>"* && ! -e "$PEND" ]] && ok "MS29 a box with no 5dive app (Enterprise, or before it is registered): asks for the firm's --client-id as before" || bad "MS29 no default" "$RC $OUT"

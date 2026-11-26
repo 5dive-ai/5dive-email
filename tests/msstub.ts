@@ -36,6 +36,8 @@ export type Ctl = {
   /** DIVE-9120: the mailbox has IMAP / Authenticated SMTP turned off (run-alone mail stand-ins). */
   imap_off?: boolean
   smtp_off?: boolean
+  /** DIVE-9314: a freshly licensed mailbox: the sign-in is taken, the next command gets "User is authenticated but not connected." */
+  imap_not_ready?: boolean
 }
 
 const b64u = (o: unknown) => Buffer.from(JSON.stringify(o)).toString('base64url')
@@ -111,7 +113,7 @@ export function identity(port = 0) {
 }
 
 /** Exchange Online's IMAP, minimal. `ok(user, token)` decides the XOAUTH2 login. */
-export function imap(ok: (user: string, token: string) => boolean) {
+export function imap(ok: (user: string, token: string) => boolean, notReady: () => boolean = () => false) {
   const mails: { uid: number; raw: Buffer; seen: boolean }[] = []
   // Every open session and how many mails it has been told of. As a real
   // server does, a session learns of new mail at once while it IDLEs, else in
@@ -156,6 +158,7 @@ export function imap(ok: (user: string, token: string) => boolean) {
         if (cmd === 'LOGIN') { w(`${tag} NO LOGIN failed.\r\n`); continue } // basic auth is off at Microsoft
         if (cmd === 'LOGOUT') { w(`* BYE Microsoft Exchange Server IMAP4 server signing off.\r\n${tag} OK LOGOUT completed.\r\n`); sock.end(); continue }
         if (!authed) { w(`${tag} BAD Command received in Invalid state.\r\n`); continue }
+        if (notReady()) { w(`${tag} BAD User is authenticated but not connected.\r\n`); continue }
         if (cmd === 'SELECT' || cmd === 'EXAMINE') {
           me.known = mails.length
           w(`* ${mails.length} EXISTS\r\n* 0 RECENT\r\n* FLAGS (\\Seen \\Answered \\Flagged \\Deleted \\Draft)\r\n* OK [PERMANENTFLAGS (\\Seen \\Answered \\Flagged \\Deleted \\Draft)] Permanent flags\r\n* OK [UIDVALIDITY 14]\r\n* OK [UIDNEXT ${nextUid}]\r\n${tag} OK [READ-WRITE] ${cmd} completed.\r\n`)
@@ -230,7 +233,7 @@ export function smtp(ok: (user: string, token: string) => boolean, off: () => bo
 if (import.meta.main) {
   // One line: the identity URL, then (DIVE-9120) the IMAP and SMTP stand-ins' ports.
   const id = identity(Number(process.argv[2]) || 0)
-  const im = imap((_u, t) => id.valid(t) && !id.ctl.imap_off)
+  const im = imap((_u, t) => id.valid(t) && !id.ctl.imap_off, () => !!id.ctl.imap_not_ready)
   const sm = smtp((_u, t) => id.valid(t), () => !!id.ctl.smtp_off)
   console.log(`${id.url} ${await im.listen()} ${await sm.listen()}`)
 }

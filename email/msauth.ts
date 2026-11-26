@@ -118,20 +118,20 @@ export function linkStart(tenant: string, clientId: string, address: string): Li
 }
 
 /** What the person sent back: the whole address of the page they landed on, or just its code. */
-export function readPasted(pasted: string): { code?: string; state?: string; error?: string; error_description?: string } {
+export function readPasted(pasted: string): { code?: string; state?: string; error?: string; error_description?: string; error_subcode?: string } {
   const t = pasted.trim().replace(/^['"<]+|['">]+$/g, '')
   const i = t.search(/[?#]/)
   const qs = i >= 0 ? t.slice(i + 1) : /^(code|error)=/.test(t) ? t : ''
   if (!qs) return /^[A-Za-z0-9._~*-]{20,}$/.test(t) ? { code: t } : {}
   const q = new URLSearchParams(qs.replace(/#/g, '&'))
   const g = (k: string) => q.get(k) ?? undefined
-  return { code: g('code'), state: g('state'), error: g('error'), error_description: g('error_description') }
+  return { code: g('code'), state: g('state'), error: g('error'), error_description: g('error_description'), error_subcode: g('error_subcode') }
 }
 
 export async function linkRedeem(p: LinkPending, pasted: string): Promise<Done> {
   if (p.expires_at <= Date.now()) throw new SignInError('expired_token', 'the sign-in link expired before it was finished', true)
   const r = readPasted(pasted)
-  if (r.error) throw explain(r.error, { error_description: r.error_description }, p.client_id)
+  if (r.error) throw explain(r.error, { error_description: r.error_description, error_subcode: r.error_subcode }, p.client_id)
   if (!r.code) throw new SignInError('no_code', "that is not the address of the page Microsoft showed after the sign-in (it starts with https://login.microsoftonline.com/common/oauth2/nativeclient?code=)", true)
   if (r.state !== undefined && r.state !== p.state) throw new SignInError('wrong_state', 'that address belongs to a different sign-in link than the one this server is waiting for', true)
   const { body, err } = await post(p.tenant, 'token', {
@@ -183,6 +183,14 @@ export function explain(err: string, body: any, clientId = ''): SignInError {
     return new SignInError('admin_consent', ours
       ? `your firm lets in only apps its Microsoft admin has approved. Send your admin this link to approve 5dive's mail sign-in once, then connect again: ${adminConsentLink(clientId)}`
       : "the firm's app is missing your IT's consent for mail (docs/IT-GUIDE.md)", true)
+  }
+  // DIVE-9314 (live): Microsoft's "Need admin approval" page names no AADSTS code; its
+  // "Return to the application" lands on error=access_denied&error_subcode=cancel. A person
+  // who said no on the consent page carries AADSTS65004 and stays "declined" below.
+  if (err === 'access_denied' && !/AADSTS65004\b/.test(d) && (ours || body?.error_subcode === 'cancel')) {
+    return new SignInError('admin_consent', ours
+      ? `Microsoft stopped the sign-in. If it said "Need admin approval", your firm lets in only apps its Microsoft admin has approved: send your admin this link to approve 5dive's mail sign-in once, then connect again: ${adminConsentLink(clientId)} (if you tapped Cancel yourself, just connect again)`
+      : `Microsoft stopped the sign-in. If it said "Need admin approval", the firm's app is missing your IT's consent for mail (docs/IT-GUIDE.md); if you tapped Cancel yourself, just connect again`, true)
   }
   const say: Record<string, string> = {
     authorization_declined: 'the sign-in was declined at Microsoft',
@@ -242,7 +250,7 @@ export function tokenSource(o: OAuth, keep: (refreshToken: string) => void) {
 // the new token, sends nothing, and says in plain words which switch is off.
 export type Box = { host: string; port: number; secure: boolean }
 export type CheckIn = { access_token: string; user: string; consumer?: boolean; imap: Box; smtp: Box }
-export type CheckOut = { ok: true } | { ok: false; error: 'imap_off' | 'smtp_off' | 'unreachable'; message: string }
+export type CheckOut = { ok: true } | { ok: false; error: 'imap_off' | 'imap_not_ready' | 'smtp_off' | 'unreachable'; message: string }
 
 function reader(sock: Socket) {
   let buf = '', ended = false, wake: (() => void) | null = null
@@ -274,18 +282,28 @@ const sasl = (user: string, token: string) => Buffer.from(`user=${user}\x01auth=
 const lastLine = (b: string) => b.trimEnd().split('\r\n').pop() ?? ''
 const smtpDone = (b: string) => b.endsWith('\r\n') && /^\d{3} /.test(lastLine(b))
 
-/** IMAP: true = logged in, false = refused, throws = could not ask. */
-async function imapLogin(c: CheckIn): Promise<boolean> {
+// DIVE-9314 (live): for up to an hour after a licence is added, Exchange takes the
+// sign-in but answers "User is authenticated but not connected." The mailbox is
+// not turned off, it is not ready yet.
+const NOT_READY = /authenticated but not connected/i
+
+/** IMAP: '' = logged in and the inbox opens, else the server's refusal; throws = could not ask. */
+async function imapLogin(c: CheckIn): Promise<string> {
   const s = await open(c.imap)
   try {
     const read = reader(s)
+    const tagged = (t: string) => (b: string) => new RegExp(`^${t} `, 'm').test(b) && b.endsWith('\r\n')
     await read(b => /^\* (OK|PREAUTH)/m.test(b))
     s.write(`c1 AUTHENTICATE XOAUTH2 ${sasl(c.user, c.access_token)}\r\n`)
     let r = await read(b => /^(c1 |\+)/m.test(b) && b.endsWith('\r\n'))
-    if (/^\+/m.test(r)) { s.write('\r\n'); r = await read(b => /^c1 /m.test(b) && b.endsWith('\r\n')) } // the error challenge, answered empty
-    const good = /^c1 OK/m.test(r)
-    if (good) s.write('c2 LOGOUT\r\n')
-    return good
+    if (/^\+/m.test(r)) { s.write('\r\n'); r = await read(tagged('c1')) } // the error challenge, answered empty
+    if (!/^c1 OK/m.test(r)) return (NOT_READY.test(r) ? r.match(NOT_READY)![0] : lastLine(r)).slice(0, 200) || 'refused'
+    // Exchange says "not connected" only to the first command after the sign-in.
+    s.write('c2 EXAMINE INBOX\r\n'); r = await read(tagged('c2'))
+    if (NOT_READY.test(r)) return r.match(NOT_READY)![0]
+    if (!/^c2 OK/m.test(r)) throw new Error(`the inbox did not open: ${lastLine(r).slice(0, 100)}`)
+    s.write('c3 LOGOUT\r\n')
+    return ''
   } finally { setTimeout(() => s.destroy(), 200) }
 }
 
@@ -318,7 +336,11 @@ export async function mailCheck(c: CheckIn): Promise<CheckOut> {
     : `in the Microsoft 365 admin center: Users > Active users > ${c.user} > Mail > Manage email apps`
   let step = 'IMAP'
   try {
-    if (!(await imapLogin(c))) {
+    const refused = await imapLogin(c)
+    if (NOT_READY.test(refused)) {
+      return { ok: false, error: 'imap_not_ready', message: `Microsoft let ${c.user} sign in, but is still setting up this mailbox (common for up to an hour after a licence is added). Nothing is wrong on your side: connect again in an hour` }
+    }
+    if (refused) {
       return { ok: false, error: 'imap_off', message: c.consumer
         ? `Outlook.com let ${c.user} sign in, but reading mail by IMAP is turned off for it. Turn it on ${where}, then connect again`
         : `Microsoft let ${c.user} sign in, but IMAP is turned off for this mailbox. Your Microsoft admin ticks IMAP and Authenticated SMTP ${where}, then connect again` }

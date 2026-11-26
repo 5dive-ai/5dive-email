@@ -535,6 +535,13 @@ describe('microsoft sign-in', () => {
       expect(explain('consent_required', {}, FAPP).code).toBe('admin_consent')
       // A person who simply said no is not sent to an admin.
       expect(explain('access_denied', { error_description: 'AADSTS65004: User declined to consent' }, FAPP).message).toBe('the sign-in was declined at Microsoft')
+      // DIVE-9314 (live): "Need admin approval" > Return to the application = access_denied, subcode cancel, no AADSTS.
+      const back = explain('access_denied', { error_subcode: 'cancel' }, FAPP)
+      expect([back.code, back.message.includes(adminConsentLink(FAPP)), back.message.includes('Need admin approval')]).toEqual(['admin_consent', true, true])
+      const backFirm = explain('access_denied', { error_subcode: 'cancel' }, CLIENT)
+      expect([backFirm.code, backFirm.message.includes("missing your IT's consent"), backFirm.message.includes('adminconsent')]).toEqual(['admin_consent', true, false])
+      expect(explain('access_denied', { error_subcode: 'cancel', error_description: 'AADSTS65004: User declined to consent' }, FAPP).message).toBe('the sign-in was declined at Microsoft')
+      expect(explain('access_denied', {}, CLIENT).message).toBe('the sign-in was declined at Microsoft')
       const u = new URL(adminConsentLink(FAPP))
       expect([u.host, u.pathname, u.searchParams.get('client_id'), u.searchParams.get('redirect_uri')]).toEqual(
         ['login.microsoftonline.com', '/organizations/v2.0/adminconsent', FAPP, 'https://login.microsoftonline.com/common/oauth2/nativeclient'])
@@ -544,8 +551,8 @@ describe('microsoft sign-in', () => {
     }
   })
   test('the mail check: IMAP off, Authenticated SMTP off, both on, and nothing listening', async () => {
-    let imapOn = true, smtpOff = false
-    const im = imapStub((_u, t) => t === 'good' && imapOn)
+    let imapOn = true, smtpOff = false, notReady = false
+    const im = imapStub((_u, t) => t === 'good' && imapOn, () => notReady)
     const sm = smtpStub((_u, t) => t === 'good', () => smtpOff)
     const [ip, sp] = [await im.listen(), await sm.listen()]
     process.env.EMAIL_MS_CHECK_PLAIN = '1'
@@ -557,7 +564,11 @@ describe('microsoft sign-in', () => {
       expect(a.ok === false && a.error).toBe('imap_off')
       expect(a.ok === false && a.message).toContain('Manage email apps')
       expect(await mailCheck({ ...c, consumer: true }).then(r => r.ok === false && r.message)).toContain('Outlook.com')
-      imapOn = true; smtpOff = true
+      imapOn = true; notReady = true
+      // DIVE-9314 (live): a freshly licensed mailbox is not ready yet, it is not turned off.
+      const nr = await mailCheck(c)
+      expect([nr.ok === false && nr.error, nr.ok === false && /setting up this mailbox/.test(nr.message), nr.ok === false && /turned off/.test(nr.message)]).toEqual(['imap_not_ready', true, false])
+      notReady = false; smtpOff = true
       const b = await mailCheck(c)
       expect(b.ok === false && b.error).toBe('smtp_off')
       expect(b.ok === false && b.message).toContain('Authenticated SMTP')
@@ -569,6 +580,23 @@ describe('microsoft sign-in', () => {
     } finally {
       delete process.env.EMAIL_MS_CHECK_PLAIN
       im.stop(); sm.server.close()
+    }
+  })
+  test('the mail check: "not connected" on the sign-in line itself is also "not ready", not "turned off"', async () => {
+    const { createServer } = await import('node:net')
+    const srv = createServer(s => {
+      s.write('* OK ready\r\n')
+      s.on('data', d => { const tag = d.toString().split(' ')[0]; s.write(`${tag} NO User is authenticated but not connected.\r\n`) })
+      s.on('error', () => {})
+    })
+    const port = await new Promise<number>(r => srv.listen(0, '127.0.0.1', () => r((srv.address() as any).port)))
+    process.env.EMAIL_MS_CHECK_PLAIN = '1'
+    try {
+      const r = await mailCheck({ access_token: 't', user: SELF, imap: { host: '127.0.0.1', port, secure: true }, smtp: { host: '127.0.0.1', port: 1, secure: false } })
+      expect(r.ok === false && r.error).toBe('imap_not_ready')
+    } finally {
+      delete process.env.EMAIL_MS_CHECK_PLAIN
+      srv.close()
     }
   })
   test('the sign-in refusals a firm meets say what their IT fixes', async () => {

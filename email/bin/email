@@ -29,7 +29,8 @@
 #       IT to set up; the token stays on this box and mail never passes 5dive).
 #       --client-id: the FIRM'S OWN app instead (their IT registers it:
 #       docs/IT-GUIDE.md), for firms that allow no outside app, and offline boxes.
-#       --json: the link comes back as {ok,data:{waiting,link,expires_at,address}}.
+#       --json: the link comes back as {ok,data:{waiting,link,expires_at,address}},
+#       and the finish (--code) as {ok,data:{connected,agent,address,account,app}}.
 #       Rerun with just --provider=microsoft to sign in again later: the app ids are kept.
 #   connect <agent> --self-hosted [--name=<shown name>]
 #       <agent>@<domain> on this box's own mail server (run `server setup` first).
@@ -452,7 +453,14 @@ _connect_microsoft() {  # <agent> <name> <info> <address> <login> <tenant> <clie
     via="signed in through 5dive's Microsoft app; the mail goes only between this server and Microsoft"
     end="End this access any time: $( [[ "$consumer" == true ]] && echo "account.microsoft.com > Privacy > Apps and services" || echo "myapps.microsoft.com > the app > Revoke, or your IT in Microsoft Entra" )."
   fi
-  cat <<MSG
+  # DIVE-9314: with --json the finish answers like the link step, one envelope on stdout.
+  local tostd=1; [[ "${FIVEDIVE_JSON_MODE:-0}" == 1 ]] && tostd=2
+  if (( tostd == 2 )); then
+    jq -cn --arg ag "$agent" --arg a "$address" --arg k "$( [[ "$consumer" == true ]] && echo outlook_com || echo microsoft_365 )" \
+      --arg v "$( [[ "$client" == "$FIVEDIVE_MS_APP" ]] && echo 5dive || echo firm )" \
+      '{ok:true, data:{connected:true, agent:$ag, address:$a, provider:"microsoft", account:$k, app:$v}}'
+  fi
+  cat >&"$tostd" <<MSG
 
 $name now reads and answers $address ($( [[ "$consumer" == true ]] && echo Outlook.com || echo "Microsoft 365" ), $via).
 
