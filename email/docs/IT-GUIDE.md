@@ -14,13 +14,23 @@
    --provider=google|other [--imap-host=… --smtp-host=…] --task=<DIVE-N>`
    and pastes the password into the one-time link.
 
-## Microsoft 365 / Outlook: your own sign-in app (once, about 5 minutes)
+## Microsoft 365 / Outlook
 
 Microsoft turned off password sign-in for IMAP and SMTP in 2022. The agent
-signs in with Microsoft's own sign-in instead, through an app that lives in
-YOUR Microsoft account. 5dive has no app and no account in between, so you
-see no "unverified app" screen, and you can end the access at any time. One app
-serves every agent's mailbox in your firm.
+signs in with Microsoft's own sign-in instead. Two ways:
+
+- **5dive's Microsoft app (the default, nothing to set up).** `connect
+  --provider=microsoft` with no `--client-id`. The person signing in sees 5dive's
+  app asking to read and send mail as that mailbox. The token stays on your
+  server; mail goes only between your server and Microsoft. If your tenant lets
+  users consent only to admin-approved apps, connect prints the one link a
+  Global or Cloud Application Administrator opens to approve it for the firm.
+  End the access in Entra > Enterprise applications (or myapps.microsoft.com).
+  IMAP and Authenticated SMTP must be on for the mailbox (below, step 2);
+  connect checks both and says which one is off.
+- **Your own sign-in app (once, about 5 minutes).** For a firm that allows no
+  outside app, or an offline box: the app lives in YOUR Microsoft account, with
+  no 5dive app in between. One app serves every agent's mailbox in your firm.
 
 **1. Create the app.** In the Microsoft Entra admin center (entra.microsoft.com):
 

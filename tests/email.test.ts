@@ -449,7 +449,8 @@ describe('spam, viruses and phishing (DIVE-8405)', () => {
 })
 
 // ── DIVE-8407: a Microsoft 365 / Outlook mailbox, signed in through the firm's own app ──
-import { signedInAs, tokenSource, deviceStart, devicePoll, oauthOk, SignInError } from '../email/msauth.ts'
+import { signedInAs, tokenSource, deviceStart, devicePoll, oauthOk, SignInError, isConsumer, explain, mailCheck, adminConsentLink } from '../email/msauth.ts'
+import { imap as imapStub, smtp as smtpStub } from './msstub.ts'
 import { identity } from './msstub.ts'
 
 describe('microsoft sign-in', () => {
@@ -464,10 +465,12 @@ describe('microsoft sign-in', () => {
     // Without the sign-in, the same endpoints with no password are no config.
     expect(parseConfig({ ...msCfg, oauth: undefined })).toBeNull()
   })
-  test('a broken sign-in is no config: another provider, a bad app id, the shared "common" tenant, no refresh token, local mode', () => {
+  test('a broken sign-in is no config: another provider, a bad app id, no refresh token, local mode', () => {
     expect(parseConfig({ ...msCfg, oauth: { ...oauth, provider: 'google' } })).toBeNull()
     expect(parseConfig({ ...msCfg, oauth: { ...oauth, client_id: 'not-a-guid' } })).toBeNull()
-    expect(parseConfig({ ...msCfg, oauth: { ...oauth, tenant: 'common' } })).toBeNull()
+    expect(parseConfig({ ...msCfg, oauth: { ...oauth, tenant: 'not a tenant' } })).toBeNull()
+    // DIVE-9120: 5dive's own app signs in at Microsoft's shared "common" authority.
+    expect(parseConfig({ ...msCfg, oauth: { ...oauth, tenant: 'common' } })?.oauth?.tenant).toBe('common')
     expect(parseConfig({ ...msCfg, oauth: { ...oauth, refresh_token: '' } })).toBeNull()
     expect(parseConfig({ ...msCfg, mode: 'local', maildir: '/var/lib/x' })).toBeNull()
     expect(oauthOk({ ...oauth, tenant: '72f988bf-86f1-41af-91ab-2d7cd011db47' })).toBe(true)
@@ -509,6 +512,91 @@ describe('microsoft sign-in', () => {
       expect([e.code, e.again, e.message]).toEqual(['invalid_grant', true, 'Microsoft wants the mailbox signed in again'])
     } finally {
       id.stop()
+    }
+  })
+  // DIVE-9120: 5dive's own Microsoft app.
+  test('a personal Outlook.com account is told apart by its tenant in the id_token', () => {
+    const tok = (c: object) => `e30.${Buffer.from(JSON.stringify(c)).toString('base64url')}.`
+    expect(isConsumer(tok({ tid: '9188040d-6c67-4c5b-b112-36a304b66dad' }))).toBe(true)
+    expect(isConsumer(tok({ tid: '72f988bf-86f1-41af-91ab-2d7cd011db47' }))).toBe(false)
+    expect(isConsumer('garbage')).toBe(false)
+  })
+  test("only the firm's admin can let the app in: 5dive's app gets the admin's one link, the firm's own app points at its IT", () => {
+    const FAPP = '5d1e0000-9120-4000-8000-0000000000aa'
+    const before = process.env.EMAIL_MS_DEFAULT_APP
+    process.env.EMAIL_MS_DEFAULT_APP = FAPP
+    try {
+      for (const d of ['AADSTS90094: Admin approval required.', 'AADSTS65001: The user or administrator has not consented', 'AADSTS90095:+Admin+consent+workflow']) {
+        const ours = explain('access_denied', { error_description: d }, FAPP)
+        expect(ours.code).toBe('admin_consent')
+        expect(ours.message).toContain(adminConsentLink(FAPP))
+        expect(explain('access_denied', { error_description: d }, CLIENT).message).toContain("missing your IT's consent")
+      }
+      expect(explain('consent_required', {}, FAPP).code).toBe('admin_consent')
+      // A person who simply said no is not sent to an admin.
+      expect(explain('access_denied', { error_description: 'AADSTS65004: User declined to consent' }, FAPP).message).toBe('the sign-in was declined at Microsoft')
+      // DIVE-9314 (live): "Need admin approval" > Return to the application = access_denied, subcode cancel, no AADSTS.
+      const back = explain('access_denied', { error_subcode: 'cancel' }, FAPP)
+      expect([back.code, back.message.includes(adminConsentLink(FAPP)), back.message.includes('Need admin approval')]).toEqual(['admin_consent', true, true])
+      const backFirm = explain('access_denied', { error_subcode: 'cancel' }, CLIENT)
+      expect([backFirm.code, backFirm.message.includes("missing your IT's consent"), backFirm.message.includes('adminconsent')]).toEqual(['admin_consent', true, false])
+      expect(explain('access_denied', { error_subcode: 'cancel', error_description: 'AADSTS65004: User declined to consent' }, FAPP).message).toBe('the sign-in was declined at Microsoft')
+      expect(explain('access_denied', {}, CLIENT).message).toBe('the sign-in was declined at Microsoft')
+      const u = new URL(adminConsentLink(FAPP))
+      expect([u.host, u.pathname, u.searchParams.get('client_id'), u.searchParams.get('redirect_uri')]).toEqual(
+        ['login.microsoftonline.com', '/organizations/v2.0/adminconsent', FAPP, 'https://login.microsoftonline.com/common/oauth2/nativeclient'])
+      expect(u.searchParams.get('scope')).toBe('https://outlook.office.com/IMAP.AccessAsUser.All https://outlook.office.com/SMTP.Send')
+    } finally {
+      if (before === undefined) delete process.env.EMAIL_MS_DEFAULT_APP; else process.env.EMAIL_MS_DEFAULT_APP = before
+    }
+  })
+  test('the mail check: IMAP off, Authenticated SMTP off, both on, and nothing listening', async () => {
+    let imapOn = true, smtpOff = false, notReady = false
+    const im = imapStub((_u, t) => t === 'good' && imapOn, () => notReady)
+    const sm = smtpStub((_u, t) => t === 'good', () => smtpOff)
+    const [ip, sp] = [await im.listen(), await sm.listen()]
+    process.env.EMAIL_MS_CHECK_PLAIN = '1'
+    const c = { access_token: 'good', user: SELF, imap: { host: '127.0.0.1', port: ip, secure: true }, smtp: { host: '127.0.0.1', port: sp, secure: false } }
+    try {
+      expect(await mailCheck(c)).toEqual({ ok: true })
+      imapOn = false
+      const a = await mailCheck(c)
+      expect(a.ok === false && a.error).toBe('imap_off')
+      expect(a.ok === false && a.message).toContain('Manage email apps')
+      expect(await mailCheck({ ...c, consumer: true }).then(r => r.ok === false && r.message)).toContain('Outlook.com')
+      imapOn = true; notReady = true
+      // DIVE-9314 (live): a freshly licensed mailbox is not ready yet, it is not turned off.
+      const nr = await mailCheck(c)
+      expect([nr.ok === false && nr.error, nr.ok === false && /setting up this mailbox/.test(nr.message), nr.ok === false && /turned off/.test(nr.message)]).toEqual(['imap_not_ready', true, false])
+      notReady = false; smtpOff = true
+      const b = await mailCheck(c)
+      expect(b.ok === false && b.error).toBe('smtp_off')
+      expect(b.ok === false && b.message).toContain('Authenticated SMTP')
+      smtpOff = false
+      im.stop()
+      await new Promise(r => setTimeout(r, 50))
+      const d = await mailCheck(c)
+      expect(d.ok === false && d.error).toBe('unreachable')
+    } finally {
+      delete process.env.EMAIL_MS_CHECK_PLAIN
+      im.stop(); sm.server.close()
+    }
+  })
+  test('the mail check: "not connected" on the sign-in line itself is also "not ready", not "turned off"', async () => {
+    const { createServer } = await import('node:net')
+    const srv = createServer(s => {
+      s.write('* OK ready\r\n')
+      s.on('data', d => { const tag = d.toString().split(' ')[0]; s.write(`${tag} NO User is authenticated but not connected.\r\n`) })
+      s.on('error', () => {})
+    })
+    const port = await new Promise<number>(r => srv.listen(0, '127.0.0.1', () => r((srv.address() as any).port)))
+    process.env.EMAIL_MS_CHECK_PLAIN = '1'
+    try {
+      const r = await mailCheck({ access_token: 't', user: SELF, imap: { host: '127.0.0.1', port, secure: true }, smtp: { host: '127.0.0.1', port: 1, secure: false } })
+      expect(r.ok === false && r.error).toBe('imap_not_ready')
+    } finally {
+      delete process.env.EMAIL_MS_CHECK_PLAIN
+      srv.close()
     }
   })
   test('the sign-in refusals a firm meets say what their IT fixes', async () => {
