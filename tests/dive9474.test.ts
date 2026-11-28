@@ -148,6 +148,8 @@ describe('the file tools against a stand-in Microsoft Graph', () => {
     const r = await f.read('b!own:i1')
     expect(r.text).toBe('Offer for Acme & Co\nPrice:\t4 200 EUR')
     expect(calls.find(c => c.path.startsWith('/dl/'))!.auth).toBe('')
+    // Microsoft leaves the download address out of a $select answer (measured live): none asked.
+    expect(calls.find(c => c.path.startsWith('/v1.0/drives/b!own/items/i1'))!.path).not.toContain('$select')
   })
   test('save never replaces a same-named file unless asked', async () => {
     await f.save({ folder: '/Clients', name: 'draft.md', text: 'hello' })

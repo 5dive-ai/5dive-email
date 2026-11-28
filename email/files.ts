@@ -136,7 +136,8 @@ export function makeFiles(tok: GraphToken, mode: () => FilesMode, opts: { tmpDir
     async read(where: string): Promise<{ name: string; text?: string; path?: string; note?: string }> {
       const sp = await spFor(where)
       need(sp)
-      const meta = await call(tok, sp, 'GET', `${itemPath(where)}?$select=id,name,size,folder,file,@microsoft.graph.downloadUrl`)
+      // No $select here: Microsoft leaves the download address out of a $select answer (measured live, DIVE-9474).
+      const meta = await call(tok, sp, 'GET', itemPath(where))
       if (meta.folder) throw new FilesError(`${meta.name} is a folder: list it instead`)
       if (Number(meta.size) > MAX_READ) throw new FilesError(`${meta.name} is ${Math.round(Number(meta.size) / 1048576)} MB: too big to read here (up to 25 MB)`)
       const url = meta['@microsoft.graph.downloadUrl']
