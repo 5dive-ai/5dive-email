@@ -43,6 +43,10 @@ signs in with Microsoft's own sign-in instead. Two ways:
    `--device-code` sign-in below needs it; it does no harm otherwise.)
 4. API permissions > Add a permission > Microsoft Graph > Delegated permissions:
    `IMAP.AccessAsUser.All`, `SMTP.Send`, `offline_access`, `openid`, `email`.
+   Optional, for agents that work in OneDrive and SharePoint files
+   (`5dive email files <agent> on`): also `Files.ReadWrite` and
+   `Sites.ReadWrite.All` (both delegated: the agent sees only what that
+   mailbox's user sees). Grant admin consent for them if your users may not.
    Then **Grant admin consent** for your organization.
 
 Or the same in one go with the Azure CLI (as an admin):

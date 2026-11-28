@@ -13,7 +13,9 @@
 
 import { readFileSync, openSync, readSync, fstatSync, closeSync } from 'node:fs'
 
-export const RISK_KINDS = ['root', 'pay', 'delete', 'send', 'settings', 'access'] as const
+// DIVE-9474: + files: the owner's OneDrive / SharePoint (files_* tools of this plugin). A stranger's
+// mail asking the agent to dig out or overwrite the firm's documents is held like a send.
+export const RISK_KINDS = ['root', 'pay', 'delete', 'send', 'settings', 'access', 'files'] as const
 export type RiskKind = (typeof RISK_KINDS)[number]
 
 // Kept in step with plugins/teams/roles.ts RISKY (each plugin directory ships alone).
@@ -28,6 +30,8 @@ export const RISKY: { kind: RiskKind; re: RegExp; what: string }[] = [
 
 export function toolRisk(tool: string, input: Record<string, unknown> | undefined): { kind: RiskKind; what: string } | null {
   const i = input ?? {}
+  // Claude Code names a plugin's MCP tool mcp__plugin_<plugin>_<server>__<tool> (older: mcp__<server>__<tool>).
+  if (/^mcp__(plugin_email_)?email__files_/.test(tool)) return { kind: 'files', what: "open or save your owner's OneDrive or SharePoint files" }
   if (tool === 'Bash') {
     const c = String(i.command ?? '')
     for (const r of RISKY) if (r.re.test(c)) return { kind: r.kind, what: r.what }

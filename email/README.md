@@ -21,6 +21,17 @@ Two ways to give an agent an address:
      instead: `--client-id=<app id>`, which your IT creates once in your own
      Microsoft account ([docs/IT-GUIDE.md](docs/IT-GUIDE.md)). One app serves
      every agent's mailbox.
+   - **Their OneDrive and SharePoint files, same sign-in:** with a Microsoft
+     mailbox connected, `sudo 5dive email files mike on` (or the switch next to
+     the mailbox in the app) asks Microsoft for one more permission and gives a
+     sign-in link, finished the same way (`connect … --code=`). The agent then
+     finds, reads (Word, Excel, PowerPoint, PDF as text) and saves files with
+     its `files_*` tools, on demand: nothing is copied to the server, and it
+     never writes over a file unless told to. SharePoint usually needs the
+     company's admin to allow it once; the agent says so in plain words and
+     OneDrive keeps working (`--onedrive-only` asks for OneDrive alone). A file's
+     text is outside text like mail, and an outside email never makes the agent
+     open the owner's files without asking. `files mike off` stops it.
    - **Google Workspace or another server:**
      `sudo 5dive email connect mike --address=mike@yourfirm.com --provider=google --task=<DIVE-N>`
      (the password comes through a one-time link, never on the command line).

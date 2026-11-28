@@ -23,6 +23,21 @@ export const SMTP_HOST = 'smtp.office365.com'
 // plus offline_access for a refresh token and openid+email to read who signed in.
 export const SCOPE = 'https://outlook.office.com/IMAP.AccessAsUser.All https://outlook.office.com/SMTP.Send offline_access openid email'
 
+// DIVE-9474: the owner's OneDrive and SharePoint files, asked for on top of the
+// mail scopes in the SAME sign-in (Microsoft's incremental consent, same app).
+// OneDrive: the signed-in person's own files. SharePoint: the sites they can open
+// (search across them, list a site's libraries). Both are delegated: the agent
+// sees only what that person sees. Microsoft asks consent for both resources in
+// one sign-in but hands out a token for one resource at a time, so the code is
+// redeemed for mail (SCOPE) and Graph tokens come from the same refresh token.
+export const FILES_SCOPE = 'https://graph.microsoft.com/Files.ReadWrite'
+export const SITES_SCOPE = 'https://graph.microsoft.com/Sites.ReadWrite.All'
+export type FilesAsk = 'all' | 'onedrive'
+export const filesScope = (f: FilesAsk | '' | undefined): string =>
+  f === 'all' ? `${FILES_SCOPE} ${SITES_SCOPE}` : f === 'onedrive' ? FILES_SCOPE : ''
+/** A Graph token's scope: Microsoft refreshes one resource at a time. */
+export const graphScope = (sharepoint: boolean) => `${FILES_SCOPE}${sharepoint ? ` ${SITES_SCOPE}` : ''} offline_access`
+
 /** login.microsoftonline.com, or a stand-in in tests. */
 import { clientIdOk, tenantOk, type OAuth } from './mail.ts'
 import { createHash, randomBytes } from 'node:crypto'
@@ -104,17 +119,17 @@ export type Done = { refresh_token: string; access_token: string; expires_at: nu
 export const REDIRECT = 'https://login.microsoftonline.com/common/oauth2/nativeclient'
 const LINK_MS = 30 * 60_000
 
-export type LinkPending = { kind: 'link'; tenant: string; client_id: string; address: string; verifier: string; state: string; link: string; expires_at: number }
+export type LinkPending = { kind: 'link'; tenant: string; client_id: string; address: string; verifier: string; state: string; link: string; expires_at: number; files?: FilesAsk }
 
-export function linkStart(tenant: string, clientId: string, address: string): LinkPending {
+export function linkStart(tenant: string, clientId: string, address: string, files?: FilesAsk): LinkPending {
   const verifier = randomBytes(48).toString('base64url')
   const state = randomBytes(12).toString('base64url')
   const challenge = createHash('sha256').update(verifier).digest('base64url')
   const q = new URLSearchParams({
-    client_id: clientId, response_type: 'code', redirect_uri: REDIRECT, response_mode: 'query', scope: SCOPE,
+    client_id: clientId, response_type: 'code', redirect_uri: REDIRECT, response_mode: 'query', scope: [SCOPE, filesScope(files)].filter(Boolean).join(' '),
     code_challenge: challenge, code_challenge_method: 'S256', state, login_hint: address, prompt: 'select_account',
   })
-  return { kind: 'link', tenant, client_id: clientId, address, verifier, state, link: `${authority()}/${encodeURIComponent(tenant)}/oauth2/v2.0/authorize?${q}`, expires_at: Date.now() + LINK_MS }
+  return { kind: 'link', tenant, client_id: clientId, address, verifier, state, link: `${authority()}/${encodeURIComponent(tenant)}/oauth2/v2.0/authorize?${q}`, expires_at: Date.now() + LINK_MS, ...(files ? { files } : {}) }
 }
 
 /** What the person sent back: the whole address of the page they landed on, or just its code. */
@@ -131,13 +146,13 @@ export function readPasted(pasted: string): { code?: string; state?: string; err
 export async function linkRedeem(p: LinkPending, pasted: string): Promise<Done> {
   if (p.expires_at <= Date.now()) throw new SignInError('expired_token', 'the sign-in link expired before it was finished', true)
   const r = readPasted(pasted)
-  if (r.error) throw explain(r.error, { error_description: r.error_description, error_subcode: r.error_subcode }, p.client_id)
+  if (r.error) throw explain(r.error, { error_description: r.error_description, error_subcode: r.error_subcode }, p.client_id, p.files)
   if (!r.code) throw new SignInError('no_code', "that is not the address of the page Microsoft showed after the sign-in (it starts with https://login.microsoftonline.com/common/oauth2/nativeclient?code=)", true)
   if (r.state !== undefined && r.state !== p.state) throw new SignInError('wrong_state', 'that address belongs to a different sign-in link than the one this server is waiting for', true)
   const { body, err } = await post(p.tenant, 'token', {
     client_id: p.client_id, grant_type: 'authorization_code', code: r.code, redirect_uri: REDIRECT, code_verifier: p.verifier, scope: SCOPE,
   })
-  if (err) throw explain(err, body, p.client_id)
+  if (err) throw explain(err, body, p.client_id, p.files)
   if (!body.refresh_token) throw new SignInError('no_refresh_token', 'Microsoft gave no lasting sign-in (the app is missing offline_access). Your IT adds it: docs/IT-GUIDE.md', true)
   return { refresh_token: body.refresh_token, access_token: body.access_token, expires_at: Date.now() + (Number(body.expires_in) || 3600) * 1000, who: signedInAs(body.id_token), consumer: isConsumer(body.id_token) }
 }
@@ -169,14 +184,21 @@ export async function devicePoll(p: Pending, waitMs: number, sleep = (ms: number
 export const fivediveApp = () => (process.env.EMAIL_MS_DEFAULT_APP || '').toLowerCase()
 
 /** The link a firm's Microsoft admin opens once to let 5dive's app read and send mail for everyone. */
-export function adminConsentLink(clientId: string): string {
-  const q = new URLSearchParams({ client_id: clientId, scope: SCOPE.split(' ').filter(s => s.startsWith('https://')).join(' '), redirect_uri: REDIRECT })
+export function adminConsentLink(clientId: string, files?: FilesAsk | ''): string {
+  const q = new URLSearchParams({ client_id: clientId, scope: `${SCOPE} ${filesScope(files)}`.split(' ').filter(s => s.startsWith('https://')).join(' '), redirect_uri: REDIRECT })
   return `https://login.microsoftonline.com/organizations/v2.0/adminconsent?${q}`
 }
 
-export function explain(err: string, body: any, clientId = ''): SignInError {
+export function explain(err: string, body: any, clientId = '', files?: FilesAsk | ''): SignInError {
   const d = String(body?.error_description || '').replace(/\+/g, ' ').split('\n')[0].slice(0, 300)
   const ours = !!clientId && clientId.toLowerCase() === fivediveApp()
+  // DIVE-9474: a refusal of the files sign-in names files, offers OneDrive alone, and its admin link asks for files too.
+  if (files && (/AADSTS(65001|90094|90095|90008)\b/.test(d) || (ours && err === 'consent_required') || (err === 'access_denied' && !/AADSTS65004\b/.test(d) && (ours || body?.error_subcode === 'cancel')))) {
+    const alone = files === 'all' ? ' Or let the agent use OneDrive alone (no SharePoint): turn it on again with "OneDrive only".' : ''
+    return new SignInError('admin_consent', ours
+      ? `Microsoft stopped it: your company's admin has to allow this once. Send your admin this link, then turn it on again: ${adminConsentLink(clientId, files)}${alone} (if you tapped Cancel yourself, just turn it on again)`
+      : `Microsoft stopped it: your company's admin has to allow files for the firm's app once (docs/IT-GUIDE.md).${alone}`, true)
+  }
   // AADSTS65001 / 90094 / 90095 / 90008: only the firm's Microsoft admin can let this app in.
   // Checked before the error name: Microsoft sends these as access_denied or consent_required.
   if (/AADSTS(65001|90094|90095|90008)\b/.test(d) || (ours && err === 'consent_required')) {
@@ -216,14 +238,14 @@ export function explain(err: string, body: any, clientId = ''): SignInError {
  * before it runs out; a new refresh token from Microsoft goes to `keep` at once
  * (it is the only one that will work from then on).
  */
-export function tokenSource(o: OAuth, keep: (refreshToken: string) => void) {
+export function tokenSource(o: OAuth, keep: (refreshToken: string) => void, scope = SCOPE) {
   let cur: { token: string; until: number } | null = null
   let inflight: Promise<{ token: string; until: number }> | null = null
   const refresh = async () => {
     const { body, err } = await post(o.tenant, 'token', {
-      client_id: o.client_id, grant_type: 'refresh_token', refresh_token: o.refresh_token, scope: SCOPE,
+      client_id: o.client_id, grant_type: 'refresh_token', refresh_token: o.refresh_token, scope,
     })
-    if (err) throw explain(err, body, o.client_id)
+    if (err) throw scope === SCOPE ? explain(err, body, o.client_id) : filesRefused(err, body, o.client_id, scope)
     if (body.refresh_token && body.refresh_token !== o.refresh_token) {
       o.refresh_token = body.refresh_token
       keep(body.refresh_token)
@@ -242,6 +264,39 @@ export function tokenSource(o: OAuth, keep: (refreshToken: string) => void) {
   }
 }
 
+
+/** DIVE-9474: a Graph token refused. A mail sign-in that never asked for files, or a SharePoint
+ *  the company's admin has not allowed, is not a dead mailbox: never "sign in again" for mail. */
+export function filesRefused(err: string, body: any, clientId: string, scope: string): SignInError {
+  const d = String(body?.error_description || '').replace(/\+/g, ' ').split('\n')[0].slice(0, 300)
+  const sp = scope.includes(SITES_SCOPE)
+  if (/AADSTS(65001|90094|90095|90008)\b/.test(d) || err === 'consent_required' || err === 'interaction_required') {
+    return new SignInError('files_consent', sp
+      ? `SharePoint is not allowed yet: your company's admin has to allow this once${clientId.toLowerCase() === fivediveApp() ? ` (${adminConsentLink(clientId, 'all')})` : ''}. OneDrive keeps working.`
+      : "OneDrive is not turned on for this mailbox yet: the owner turns it on in the app (the agent's Email: \"use your OneDrive and SharePoint files\")", false)
+  }
+  return explain(err, body, clientId)
+}
+
+export type FilesCheck = { onedrive: boolean; sharepoint: boolean; refresh_token: string; message?: string }
+/** After a files sign-in: can this refresh token reach OneDrive (and SharePoint)? Sends and changes nothing. */
+export async function filesCheck(o: OAuth, ask: FilesAsk): Promise<FilesCheck> {
+  const graph = (process.env.EMAIL_GRAPH_BASE || 'https://graph.microsoft.com/v1.0').replace(/\/+$/, '')
+  const out: FilesCheck = { onedrive: false, sharepoint: false, refresh_token: o.refresh_token }
+  const keep = (rt: string) => { out.refresh_token = rt }
+  // A token is the consent proven. The read after it only adds a plain note: a new Microsoft 365
+  // user's OneDrive does not exist until they open it once (Microsoft answers 404 until then).
+  const probe = async (scope: string, path: string): Promise<string> => {
+    const t = await tokenSource(o, keep, scope).get()
+    const r = await fetch(`${graph}${path}`, { headers: { authorization: `Bearer ${t.token}` }, signal: AbortSignal.timeout(20_000) }).catch(() => null)
+    return !r ? 'Microsoft did not answer the first look; it may work in a minute' : r.ok ? '' : r.status === 404 && path.startsWith('/me/drive') ? 'OneDrive is not set up for this mailbox yet: sign in once at onedrive.com as this mailbox, then it works' : `Microsoft answered ${r.status} to the first look`
+  }
+  try { const note = await probe(graphScope(false), '/me/drive?$select=id'); out.onedrive = true; if (note) out.message = note } catch (e) { out.message = (e as Error).message; return out }
+  if (ask === 'all') {
+    try { const note = await probe(graphScope(true), '/sites?search=*&$top=1&$select=id'); out.sharepoint = !note || !/answered 40[13]/.test(note); if (note && !out.message) out.message = note } catch (e) { out.message = (e as Error).message }
+  }
+  return out
+}
 
 // ── DIVE-9120: does the mailbox let mail in and out with this sign-in? ────────
 // Microsoft takes the sign-in even when IMAP or Authenticated SMTP is turned
@@ -360,7 +415,8 @@ export async function mailCheck(c: CheckIn): Promise<CheckOut> {
 
 // ── CLI: `bun msauth.ts link <tenant> <client_id> <address>` / `bun msauth.ts redeem <pending.json>` (pasted address on stdin)
 //        device code: `bun msauth.ts start <tenant> <client_id> <address>` / `bun msauth.ts poll <pending.json> <wait seconds>`
-//        mail check: `bun msauth.ts check` (CheckIn JSON on stdin; exit 0 ok, 1 refused, 75 could not ask) ──
+//        mail check: `bun msauth.ts check` (CheckIn JSON on stdin; exit 0 ok, 1 refused, 75 could not ask)
+//        files check (DIVE-9474): `bun msauth.ts files-check` ({tenant,client_id,refresh_token,ask} on stdin) ──
 // One JSON line on stdout; exit 0 done/started, 75 still waiting, 1 refused.
 if (import.meta.main) {
   const [verb, ...a] = process.argv.slice(2)
@@ -376,9 +432,14 @@ if (import.meta.main) {
       if (!d) { out({ pending: true, user_code: p.user_code, link: p.link, expires_at: p.expires_at }); process.exit(75) }
       out({ refresh_token: d.refresh_token, access_token: d.access_token, who: d.who, consumer: d.consumer })
     } else if (verb === 'link') {
-      const [tenant, clientId, address] = a
-      if (!tenantOk(tenant) || !clientIdOk(clientId) || !address) throw new SignInError('usage', 'usage: link <tenant> <client_id> <address>', true)
-      out(linkStart(tenant, clientId, address))
+      const [tenant, clientId, address, f] = a
+      const files = f === '--files=all' ? 'all' : f === '--files=onedrive' ? 'onedrive' : undefined
+      if (!tenantOk(tenant) || !clientIdOk(clientId) || !address || (f !== undefined && !files)) throw new SignInError('usage', 'usage: link <tenant> <client_id> <address> [--files=all|onedrive]', true)
+      out(linkStart(tenant, clientId, address, files))
+    } else if (verb === 'files-check') {
+      // DIVE-9474: {tenant, client_id, refresh_token, ask} on stdin; the refresh token Microsoft may rotate comes back.
+      const i = JSON.parse(await new Response(Bun.stdin.stream()).text())
+      out(await filesCheck({ provider: 'microsoft', tenant: i.tenant, client_id: i.client_id, refresh_token: i.refresh_token }, i.ask === 'all' ? 'all' : 'onedrive'))
     } else if (verb === 'redeem') {
       // The pasted address comes on stdin, never in argv.
       const p: LinkPending = JSON.parse(await Bun.file(a[0]).text())

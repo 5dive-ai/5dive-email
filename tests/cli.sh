@@ -394,6 +394,56 @@ else
      && ! -e "$PEND" && ! -e "$PEND.done" && "$(cat "$W/channels")" == "telegram,email" ]] \
     && ok "MS25 the app's paste (code=…&state=…), IMAP and SMTP both log in: connected through 5dive's app at common, only the refresh token kept, never printed" \
     || bad "MS25 default app connect" "$RC $OUT $(jq -c . "$CFG" 2>/dev/null)"
+  echo "  OneDrive and SharePoint through the same sign-in (DIVE-9474)"
+  export EMAIL_GRAPH_BASE="$MSURL/v1.0"
+  OUT=$(FIVEDIVE_JSON_MODE=1 bash "$BIN" status max 2>&1)
+  [[ "$(jq -c '.data | [.files,.files_ready,.files_why]' <<<"$OUT")" == '["off",true,""]' ]] && ok "F1 status --json: files off, ready (a Microsoft mailbox, online)" || bad "F1 status files" "$OUT"
+  RT0=$(jq -r .oauth.refresh_token "$CFG"); N0=$(curl -fsS "$MSURL/_log" | jq length)
+  OUT=$(bash "$BIN" files max on --json 2>/dev/null); RC=$?
+  LINK=$(jq -r '.data.link // empty' <<<"$OUT" 2>/dev/null); Q="${LINK#*\?}"
+  [[ $RC == 6 && "$(jq -r '[.ok,.data.waiting,.data.address,.data.files] | @tsv' <<<"$OUT")" == "true	microsoft_signin	$A	all" \
+     && "$(qp scope)" == *"IMAP.AccessAsUser.All"* && "$(qp scope)" == *"https://graph.microsoft.com/Files.ReadWrite"* && "$(qp scope)" == *"https://graph.microsoft.com/Sites.ReadWrite.All"* \
+     && "$(qp client_id)" == "$FAPP" && "$(jq -r .files "$PEND")" == all && "$(jq -r .oauth.refresh_token "$CFG")" == "$RT0" && "$(curl -fsS "$MSURL/_log" | jq length)" == "$N0" ]] \
+    && ok "F2 files on: one sign-in link from the SAME app asking mail + OneDrive + SharePoint; the mailbox is untouched until it finishes" || bad "F2 files on" "$RC $OUT"
+  ST=$(qp state); CH=$(qp code_challenge)
+  ctl "{\"code\":\"ac-f1\",\"challenge\":\"$CH\",\"who\":\"max@example.com\"}"
+  OUT=$(bash "$BIN" connect max --provider=microsoft --code="code=ac-f1&state=$ST" --json 2>/dev/null); RC=$?
+  RT=$(jq -r .oauth.refresh_token "$CFG")
+  [[ $RC == 0 && "$(jq -r '[.data.connected,.data.files] | @tsv' <<<"$OUT")" == "true	onedrive_sharepoint" && "$(jq -r .files "$CFG")" == onedrive_sharepoint \
+     && "$RT" != "$RT0" && "$OUT" != *"$RT"* && "$(jq -r .oauth.client_id "$CFG")" == "$FAPP" && ! -e "$PEND" \
+     && "$(curl -fsS "$MSURL/_log" | jq -r '[.[] | select(.path | startswith("graph"))] | length')" == 2 ]] \
+    && ok "F3 the app's usual paste finishes it: OneDrive and SharePoint each answered with a token from the same refresh token, the newest one kept, files on" || bad "F3 files finish" "$RC $OUT $(jq -c . "$CFG")"
+  OUT=$(FIVEDIVE_JSON_MODE=1 bash "$BIN" status max 2>&1)
+  [[ "$(jq -r .data.files <<<"$OUT")" == onedrive_sharepoint ]] && ok "F4 status says files: onedrive_sharepoint" || bad "F4 status on" "$OUT"
+  run files max on
+  Q=$(jq -r .link "$PEND"); Q="${Q#*\?}"; ST=$(qp state); CH=$(qp code_challenge)
+  ctl "{\"code\":\"ac-f2\",\"challenge\":\"$CH\",\"sites_refused\":true}"
+  run connect max --provider=microsoft --code="code=ac-f2&state=$ST"
+  [[ $RC == 0 && "$(jq -r .files "$CFG")" == onedrive && "$OUT" == *"admin may have to allow it once"* && "$OUT" == *"OneDrive works"* ]] \
+    && ok "F5 SharePoint refused (the company's admin has not allowed it): OneDrive alone is on, said in plain words" || bad "F5 sharepoint refused" "$RC $OUT"
+  run files max on
+  Q=$(jq -r .link "$PEND"); Q="${Q#*\?}"; ST=$(qp state)
+  run connect max --provider=microsoft --code="error=access_denied&error_subcode=cancel&state=$ST"
+  [[ $RC == 6 && "$OUT" == *"company's admin has to allow this once"* && "$OUT" == *"adminconsent"* && "$OUT" == *"Sites.ReadWrite.All"* && "$OUT" == *"OneDrive only"* && "$(jq -r .files "$CFG")" == onedrive ]] \
+    && ok "F6 Microsoft's 'Need admin approval': the admin link asks for files too, OneDrive-only offered, the switch as it was" || bad "F6 admin approval" "$RC $OUT"
+  run files max on --onedrive-only
+  Q=$(jq -r .link "$PEND"); Q="${Q#*\?}"
+  [[ $RC == 6 && "$(qp scope)" == *"Files.ReadWrite"* && "$(qp scope)" != *"Sites."* ]] && ok "F7 --onedrive-only asks for OneDrive alone" || bad "F7 onedrive only" "$RC $(qp scope)"
+  ST=$(qp state); CH=$(qp code_challenge)
+  ctl "{\"code\":\"ac-f3\",\"challenge\":\"$CH\",\"sites_refused\":false,\"files_refused\":true}"
+  run connect max --provider=microsoft --code="code=ac-f3&state=$ST"
+  [[ $RC == 6 && "$OUT" == *"did not allow its files"* && "$OUT" == *"Mail is unchanged"* && "$(jq -r .files "$CFG")" == onedrive ]] \
+    && ok "F8 Microsoft signed in but gave no files token: refused in words, mail and the switch unchanged" || bad "F8 files refused" "$RC $OUT"
+  ctl '{"files_refused":false}'
+  OUT=$(bash "$BIN" files max off --json 2>/dev/null); RC=$?
+  [[ $RC == 0 && "$(jq -r .data.files <<<"$OUT")" == off && "$(jq -r .files "$CFG")" == off && "$(jq -r .oauth.provider "$CFG")" == microsoft ]] \
+    && ok "F9 files off: the agent's file tools stop, the mailbox stays connected" || bad "F9 files off" "$RC $OUT"
+  touch "$W/local-only"
+  SJ=$(FIVE_LOCAL_ONLY_FILE="$W/local-only" FIVEDIVE_JSON_MODE=1 bash "$BIN" status max 2>&1)
+  FIVE_LOCAL_ONLY_FILE="$W/local-only" run files max on
+  [[ "$(jq -c '.data | [.files_ready,.files_why]' <<<"$SJ")" == '[false,"offline"]' && $RC == 10 && "$OUT" == *"need the internet"* ]] \
+    && ok "F10 an offline box: status says files are not ready (offline), files on refuses in words" || bad "F10 offline" "$RC $OUT"
+  rm -f "$W/local-only"
   run connect max --address=pat@outlook.com --provider=microsoft
   Q=$(jq -r .link "$PEND"); Q="${Q#*\?}"; ST=$(qp state); CH=$(qp code_challenge)
   ctl "{\"code\":\"ac-24\",\"challenge\":\"$CH\",\"who\":\"pat@outlook.com\",\"tid\":\"9188040d-6c67-4c5b-b112-36a304b66dad\"}"
