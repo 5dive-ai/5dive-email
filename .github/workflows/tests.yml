@@ -31,6 +31,9 @@ jobs:
       # DIVE-8464: the typed fallback, the Codex adapter and the Codex mail guard.
       - name: every setup (DIVE-8464)
         run: bun test tests/dive8464.test.ts
+      # DIVE-9474: OneDrive and SharePoint through the mailbox's Microsoft sign-in.
+      - name: files (DIVE-9474)
+        run: bun test tests/dive9474.test.ts
       - name: the Codex entry points the manifest names exist
         run: jq -r '.fivedive.channel | select(.harnesses | index("codex")) | .codex_adapter, .codex_hook' email/.claude-plugin/plugin.json | while read -r f; do test -f "email/$f" || { echo "missing email/$f"; exit 1; }; done
       - name: cli

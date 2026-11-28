@@ -381,6 +381,69 @@ MSG
   (umask 077; printf '%s\n' "$out" >"$pend.done")
 }
 
+# DIVE-9474: the owner's OneDrive and SharePoint files, through the SAME Microsoft
+# sign-in as the mailbox: one more Microsoft consent (incremental), no second app.
+# `on` makes the sign-in link (same paste-back as connect; finished by
+# `connect <agent> --provider=microsoft --code=…`), `off` stops the agent's file tools.
+email_files() {
+  local agent="" action="" only=0 a
+  for a in "$@"; do
+    case "$a" in
+      on|off) [[ -z "$action" ]] && action="$a" || fail "$E_USAGE" "on or off, once" ;;
+      --onedrive-only) only=1 ;;
+      --json) export FIVEDIVE_JSON_MODE=1 ;;
+      -*) fail "$E_USAGE" "unknown flag: $a" ;;
+      *) [[ -z "$agent" ]] && agent="$a" || fail "$E_USAGE" "one agent at a time" ;;
+    esac
+  done
+  [[ "${FIVEDIVE_JSON_MODE:-0}" == 1 ]] && EMAIL_JSON_FAIL=1
+  [[ -n "$agent" && -n "$action" ]] || fail "$E_USAGE" "usage: sudo 5dive email files <agent> on [--onedrive-only] | off"
+  _name_ok "$agent" || fail "$E_VALIDATION" "not an agent name: $agent"
+  [[ $EUID -eq 0 ]] || fail "$E_PERMISSION" "run it as root: sudo 5dive email files $agent $action"
+  local cfg; cfg=$(_cfg "$agent")
+  [[ -r "$cfg" && "$(jq -r '.oauth.provider // empty' "$cfg" 2>/dev/null)" == microsoft ]] \
+    || fail "$E_VALIDATION" "files come with a Microsoft (Outlook / Microsoft 365) mailbox: connect one for $agent first (sudo 5dive email connect $agent --address=<a> --provider=microsoft)"
+  if [[ "$action" == off ]]; then
+    _install_cfg "$agent" "$(jq -c '.files = "off"' "$cfg")"
+    email_audit files "$agent" off
+    if [[ "${FIVEDIVE_JSON_MODE:-0}" == 1 ]]; then jq -cn --arg a "$agent" '{ok:true, data:{agent:$a, files:"off"}}'; return 0; fi
+    echo "$agent no longer uses the OneDrive and SharePoint files. To take the permission back at Microsoft too: myapps.microsoft.com > the app > Revoke."
+    return 0
+  fi
+  _offline && fail "$E_PERMISSION" "this server is offline: OneDrive and SharePoint need the internet"
+  local address tenant client bun pend kind=all
+  address=$(jq -r '.address' "$cfg"); tenant=$(jq -r '.oauth.tenant' "$cfg"); client=$(jq -r '.oauth.client_id' "$cfg")
+  # A personal Outlook.com account has a OneDrive and no SharePoint (Microsoft refuses that permission for it).
+  (( only )) || [[ "$(jq -r '.smtp.host // empty' "$cfg")" == smtp-mail.outlook.com ]] && kind=onedrive
+  bun=$(_bun); pend=$(_ms_pending "$agent")
+  [[ -x "$bun" ]] || fail "$E_VALIDATION" "bun is not on this server (the email channel runs on it): sudo 5dive self-update"
+  rm -f "$pend" "$pend.done"
+  step "Making a Microsoft sign-in link for $address's files"
+  local out rc=0
+  out=$("$bun" "$EMAIL_PLUGIN_ROOT/msauth.ts" link "$tenant" "$client" "$address" "--files=$kind") || rc=$?
+  (( rc == 0 )) || fail "$E_AUTH_REQUIRED" "$(jq -r '.message // "the sign-in link could not be made"' <<<"$out" 2>/dev/null || echo "the sign-in link could not be made")"
+  install -d -m 700 "$CONNECTORS_DIR"
+  (umask 077; printf '%s\n' "$out" >"$pend")
+  email_audit files "$agent" on "--kind=$kind"
+  if [[ "${FIVEDIVE_JSON_MODE:-0}" == 1 ]]; then
+    jq -c '{ok:true, data:{waiting:"microsoft_signin", link, expires_at, address, files}}' "$pend"
+    exit "$E_AUTH_REQUIRED"
+  fi
+  cat <<MSG
+
+To let $agent use $address's $( [[ "$kind" == all ]] && echo "OneDrive and SharePoint files" || echo "OneDrive files" ), the person who signs in to that mailbox:
+
+  1. opens this link:
+     $(jq -r .link "$pend")
+  2. signs in as $address and accepts the added permission.
+  3. lands on an empty Microsoft page: copies the whole address from the
+     browser's address bar and sends it back within 10 minutes.
+
+Then: sudo 5dive email connect $agent --provider=microsoft --code='<the address they sent>'
+MSG
+  exit "$E_AUTH_REQUIRED"
+}
+
 _connect_microsoft() {  # <agent> <name> <info> <address> <login> <tenant> <client> <wait> <ih> <ip> <is> <sh> <sp> <ss> <code> <device>
   local agent="$1" name="$2" info="$3" address="$4" login="$5" tenant="$6" client="$7" wait="$8"
   local ih="$9" ip="${10}" is="${11}" sh="${12}" sp="${13}" ss="${14}" code="${15}" dev="${16}"
@@ -406,6 +469,8 @@ _connect_microsoft() {  # <agent> <name> <info> <address> <login> <tenant> <clie
     rm -f "$pend"
   fi
   rm -f "$pend.done"
+  # DIVE-9474: a sign-in made by `email files <agent> on` also asked for the owner's files.
+  local files_ask=""; [[ -n "$code" && -r "$pend" ]] && files_ask=$(jq -r '.files // empty' "$pend")
   if (( dev )); then _ms_device "$agent" "$address" "$login" "$tenant" "$client" "$wait" "$pend"
   else _ms_link "$agent" "$address" "$login" "$tenant" "$client" "$code" "$pend"
   fi
@@ -434,8 +499,24 @@ _connect_microsoft() {  # <agent> <name> <info> <address> <login> <tenant> <clie
     (( rc == 0 )) || echo "warning: $(jq -r '.message // "the mail check did not answer"' <<<"$chk" 2>/dev/null || echo "the mail check did not answer"); connecting anyway." >&2
   fi
 
+  # DIVE-9474: the files half. Microsoft took the sign-in; can the new token reach OneDrive (and SharePoint)?
+  local files_mode="" files_note=""
+  if [[ -n "$files_ask" ]]; then
+    step "Checking OneDrive$( [[ "$files_ask" == all ]] && echo " and SharePoint" ) with this sign-in"
+    local fc; fc=$(jq -c --arg t "$tenant" --arg c "$client" --arg k "$files_ask" '{tenant:$t, client_id:$c, refresh_token, ask:$k}' <<<"$out" \
+      | "$bun" "$EMAIL_PLUGIN_ROOT/msauth.ts" files-check 2>/dev/null) || true
+    if [[ "$(jq -r '.onedrive // false' <<<"$fc" 2>/dev/null)" != true ]]; then
+      out=""
+      fail "$E_AUTH_REQUIRED" "Microsoft signed in $address but did not allow its files ($(jq -r '.message // "no answer"' <<<"$fc" 2>/dev/null || echo "no answer")). Mail is unchanged. Turn it on again: sudo 5dive email files $agent on"
+    fi
+    out=$(jq -c --arg rt "$(jq -r .refresh_token <<<"$fc")" '.refresh_token = $rt' <<<"$out")
+    files_mode=onedrive; [[ "$(jq -r .sharepoint <<<"$fc")" == true ]] && files_mode=onedrive_sharepoint
+    files_note=$(jq -r '.message // empty' <<<"$fc")
+  fi
+
   step "Writing $agent's email settings ($address, Microsoft sign-in)"
-  local keep; keep=$(jq -c '{approve_new, approve_inbound, allowed, daily_cap, free_domains, check_sender, trusted_authserv_id, exchange} | with_entries(select(.value != null))' "$cfg" 2>/dev/null || echo '{}')
+  local keep; keep=$(jq -c '{approve_new, approve_inbound, allowed, daily_cap, free_domains, check_sender, trusted_authserv_id, exchange, files} | with_entries(select(.value != null))' "$cfg" 2>/dev/null || echo '{}')
+  [[ -n "$files_mode" ]] && keep=$(jq -c --arg f "$files_mode" '.files = $f' <<<"$keep")
   _install_cfg "$agent" "$(jq -n --arg a "$address" --arg n "$name" --arg ih "$ih" --argjson ip "$ip" --argjson is "$is" \
       --arg sh "$sh" --argjson sp "$sp" --argjson ss "$ss" --arg u "$login" --arg t "$tenant" --arg c "$client" \
       --argjson keep "$keep" --argjson got "$out" '
@@ -458,7 +539,17 @@ _connect_microsoft() {  # <agent> <name> <info> <address> <login> <tenant> <clie
   if (( tostd == 2 )); then
     jq -cn --arg ag "$agent" --arg a "$address" --arg k "$( [[ "$consumer" == true ]] && echo outlook_com || echo microsoft_365 )" \
       --arg v "$( [[ "$client" == "$FIVEDIVE_MS_APP" ]] && echo 5dive || echo firm )" \
-      '{ok:true, data:{connected:true, agent:$ag, address:$a, provider:"microsoft", account:$k, app:$v}}'
+      --arg f "$files_mode" --arg fn "$files_note" \
+      '{ok:true, data:({connected:true, agent:$ag, address:$a, provider:"microsoft", account:$k, app:$v} + (if $f != "" then {files:$f, files_note:$fn} else {} end))}'
+  fi
+  if [[ -n "$files_mode" ]]; then
+    cat >&"$tostd" <<MSG
+
+$name can now use $address's $( [[ "$files_mode" == onedrive_sharepoint ]] && echo "OneDrive and SharePoint files" || echo "OneDrive files" ) (read on demand, nothing is copied to this server).
+$( [[ "$files_ask" == all && "$files_mode" == onedrive ]] && echo "  SharePoint did not answer yet: your company's admin may have to allow it once. OneDrive works." )$( [[ -n "$files_note" ]] && echo "  Note: $files_note" )
+  Turn it off any time: sudo 5dive email files $agent off
+MSG
+    return 0
   fi
   cat >&"$tostd" <<MSG
 
@@ -548,7 +639,9 @@ email_status() {
       --arg ch "$chans" --arg last "$last" --argjson h "$held" --argjson hi "$held_in" --argjson s "$sent" --argjson al "$allowed" \
       --arg sc "$sender" --arg sp "$spam" --arg vi "$virus" --arg sv "$server" --arg si "$signin" \
       --argjson msa "$([[ -n "$FIVEDIVE_MS_APP" ]] && echo true || echo false)" \
-      '{ok:true, data:{agent:$a, microsoft_app:$msa, connected:$c, address:$ad, mode:$m, signin:$si, gate:$g, inbound_gate:$d, sender_check:$sc, sender_server:$sv, spam_filter:$sp, virus_scan:$vi, daily_cap:($cap|tonumber? // 50), sent_today:$s, held:$h, held_inbound:$hi, channels:$ch, last_message:$last, allowed:$al}}'
+      --arg fm "$(jq -r '.files // "off" | if . == "onedrive" or . == "onedrive_sharepoint" then . else "off" end' "$cfg" 2>/dev/null || echo off)" \
+      --arg fw "$( if [[ "$signin" != microsoft ]]; then echo not_microsoft; elif _offline; then echo offline; fi )" \
+      '{ok:true, data:{agent:$a, microsoft_app:$msa, files:$fm, files_ready:($fw == ""), files_why:$fw, connected:$c, address:$ad, mode:$m, signin:$si, gate:$g, inbound_gate:$d, sender_check:$sc, sender_server:$sv, spam_filter:$sp, virus_scan:$vi, daily_cap:($cap|tonumber? // 50), sent_today:$s, held:$h, held_inbound:$hi, channels:$ch, last_message:$last, allowed:$al}}'
     return 0
   fi
   echo "agent:      $agent"
@@ -976,6 +1069,7 @@ _email_main() {
     gate) email_gate "$@" ;;
     allow) email_allow "$@" ;;
     cap) email_cap "$@" ;;
+    files) email_files "$@" ;;
     server) email_server "$@" ;;
     ""|-h|--help|help)
       cat >&2 <<'USAGE'
@@ -1001,13 +1095,16 @@ _email_main() {
   sudo 5dive email allow <agent> <address|@domain>... [--remove]
                                  mail both ways without asking
   sudo 5dive email cap <agent> <n>       mails a day (default 50)
+  sudo 5dive email files <agent> on [--onedrive-only] | off
+                                 a Microsoft mailbox's OneDrive and SharePoint files, same sign-in
+                                 (one more Microsoft consent; finish like connect, with --code=)
   sudo 5dive email server setup --domain=<d> [--relay=resend | --relay-host=<h> --relay-login=<u>]
   5dive email server status
   5dive email server check       can this server send mail itself? (port 25 out)
 USAGE
       [[ -n "$sub" ]] && return 0
       return "$E_USAGE" ;;
-    *) fail "$E_USAGE" "unknown email command: $sub (connect|status|disconnect|gate|allow|cap|server)" ;;
+    *) fail "$E_USAGE" "unknown email command: $sub (connect|status|disconnect|gate|allow|cap|files|server)" ;;
   esac
 }
 

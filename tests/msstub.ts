@@ -38,6 +38,10 @@ export type Ctl = {
   smtp_off?: boolean
   /** DIVE-9314: a freshly licensed mailbox: the sign-in is taken, the next command gets "User is authenticated but not connected." */
   imap_not_ready?: boolean
+  /** DIVE-9474: refresh for the SharePoint permission is refused (the company's admin has not allowed it). */
+  sites_refused?: boolean
+  /** DIVE-9474: refresh for any Graph (files) permission is refused (never consented). */
+  files_refused?: boolean
 }
 
 const b64u = (o: unknown) => Buffer.from(JSON.stringify(o)).toString('base64url')
@@ -67,6 +71,15 @@ export function identity(port = 0) {
       const u = new URL(req.url)
       if (u.pathname === '/_ctl') { Object.assign(ctl, await req.json()); return Response.json(ctl) }
       if (u.pathname === '/_log') return Response.json(log)
+      // DIVE-9474: the two Graph reads the files check makes, with a token this stand-in issued.
+      if (u.pathname.startsWith('/v1.0/')) {
+        const tok = (req.headers.get('authorization') ?? '').replace(/^Bearer /, '')
+        log.push({ path: `graph ${u.pathname}`, tenant: '', fields: { search: u.search } })
+        if ((access.get(tok) ?? 0) <= Date.now()) return Response.json({ error: { code: 'InvalidAuthenticationToken', message: 'expired' } }, { status: 401 })
+        if (u.pathname === '/v1.0/me/drive') return Response.json({ id: 'b!own' })
+        if (u.pathname === '/v1.0/sites') return Response.json({ value: [{ id: 's1' }] })
+        return Response.json({ error: { code: 'itemNotFound', message: 'item not found' } }, { status: 404 })
+      }
       const m = u.pathname.match(/^\/([^/]+)\/oauth2\/v2\.0\/(devicecode|token)$/)
       if (!m || req.method !== 'POST') return new Response('not found', { status: 404 })
       const fields = Object.fromEntries(new URLSearchParams(await req.text()))
@@ -98,6 +111,8 @@ export function identity(port = 0) {
       }
       if (fields.grant_type === 'refresh_token') {
         if (ctl.dead || !refresh.has(fields.refresh_token)) return err('invalid_grant', 'AADSTS50173: The provided grant has expired due to it being revoked.')
+        if (ctl.files_refused && /graph\.microsoft\.com/.test(fields.scope ?? '')) return err('invalid_grant', 'AADSTS65001: The user or administrator has not consented to use the application.')
+        if (ctl.sites_refused && /Sites\./.test(fields.scope ?? '')) return err('invalid_grant', 'AADSTS65001: The user or administrator has not consented to use the application.')
         refresh.delete(fields.refresh_token) // rotation: the old one is spent
         return Response.json(issue(false))
       }
